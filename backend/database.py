@@ -1,9 +1,19 @@
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text, Boolean, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text, Boolean, DateTime, event
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.sql import text
 import os
 from dotenv import load_dotenv
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
+
+# pgvector integration: install with `pip install pgvector`
+try:
+    from pgvector.sqlalchemy import Vector
+    PGVECTOR_AVAILABLE = True
+except ImportError:
+    Vector = None
+    PGVECTOR_AVAILABLE = False
+    print("[database] pgvector package not installed — vector storage unavailable. Run: pip install pgvector")
 
 load_dotenv()
 
@@ -40,10 +50,46 @@ class Interaction(Base):
     __tablename__ = "interactions"
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True) # Simple string ID for local use
+    user_id = Column(String, index=True)
     tmdb_id = Column(Integer, index=True)
-    interaction_type = Column(String) # "like", "dislike"
+    interaction_type = Column(String)  # "like" | "dislike"
     timestamp = Column(DateTime, default=datetime.utcnow)
+
+
+class MediaEmbedding(Base):
+    """
+    Stores the vector embedding for each piece of media.
+
+    Kept in a separate table from `Media` so that the metadata table stays
+    lean — embeddings are large (384-768 floats) and are only needed during
+    similarity search, not for general metadata queries.
+
+    Dimension notes
+    ---------------
+    - 384  — paraphrase-multilingual-MiniLM-L12-v2  (HuggingFace, default)
+    - 768  — models/embedding-001                   (Gemini, when GEMINI_API_KEY is set)
+
+    Set VECTOR_DIM env var to match whichever model you use.  The default is 384.
+    Changing the dimension after the table exists requires a manual column
+    migration or a DROP + recreate of media_embeddings.
+    """
+    __tablename__ = "media_embeddings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tmdb_id = Column(Integer, nullable=False, index=True)
+    media_type = Column(String, nullable=False)          # "movie" | "tv"
+
+    if PGVECTOR_AVAILABLE and Vector is not None:
+        _dim = int(os.getenv("VECTOR_DIM", "384"))
+        embedding = Column(Vector(_dim), nullable=True)
+    else:
+        # Graceful fallback: store as opaque text blob (not query-able as vector)
+        embedding = Column(Text, nullable=True)
+
+    __table_args__ = (
+        # Unique constraint so upsert logic is clean
+        __import__('sqlalchemy').UniqueConstraint('tmdb_id', 'media_type', name='uq_media_embedding'),
+    )
 
 
 class User(Base):
@@ -79,15 +125,54 @@ def get_user_by_username(db: Session, username: str) -> Optional[User]:
     return db.query(User).filter(User.username == username).first()
 
 
+def get_embedding_by_tmdb_id(db: Session, tmdb_id: int, media_type: str) -> Optional[MediaEmbedding]:
+    """Return the MediaEmbedding row, or None."""
+    return (
+        db.query(MediaEmbedding)
+        .filter(MediaEmbedding.tmdb_id == tmdb_id, MediaEmbedding.media_type == media_type)
+        .first()
+    )
+
+
+def upsert_embedding(db: Session, tmdb_id: int, media_type: str, embedding: List[float]) -> None:
+    """
+    Insert or update the vector embedding for a given (tmdb_id, media_type) pair.
+    Used by data_ingestor.py when rebuilding the index.
+    """
+    existing = get_embedding_by_tmdb_id(db, tmdb_id, media_type)
+    if existing:
+        existing.embedding = embedding
+    else:
+        db.add(MediaEmbedding(tmdb_id=tmdb_id, media_type=media_type, embedding=embedding))
+    db.commit()
+
+
 # ── DB initialisation + admin seeding ─────────────────────────────────────────
+
+def _ensure_pgvector_extension():
+    """
+    Install the pgvector PostgreSQL extension if it does not already exist.
+    This is a no-op on SQLite (which doesn't support extensions).
+    """
+    url = str(engine.url)
+    if url.startswith("sqlite"):
+        return
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+            conn.commit()
+        print("[database] pgvector extension ensured.")
+    except Exception as e:
+        print(f"[database] Could not install pgvector extension: {e}")
+        print("[database] Run manually as a superuser: CREATE EXTENSION vector;")
+
 
 def init_db():
     """
-    Create all tables and, if the `users` table is empty, seed the admin
-    account from ADMIN_USERNAME / ADMIN_PASSWORD env vars.
-
-    This is intentionally idempotent: safe to call on every startup.
+    Create all tables, ensure the pgvector extension is installed, and seed admin.
+    Idempotent: safe to call on every startup.
     """
+    _ensure_pgvector_extension()
     Base.metadata.create_all(bind=engine)
     _seed_admin()
 

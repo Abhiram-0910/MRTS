@@ -43,6 +43,15 @@ try:
         enable_utc=True,
         task_acks_late=True,
         worker_prefetch_multiplier=1,
+        # ── Result expiry ──────────────────────────────────────────────────
+        # Without this, Celery writes a tombstone to Redis for every finished
+        # task and NEVER removes it — Redis memory grows unboundedly.
+        # 3600 s (1 hour) is long enough for any polling client to collect the
+        # result, while preventing memory leaks in long-running deployments.
+        result_expires=3600,
+        # Renew the TTL when the result is retrieved, so tasks still being
+        # polled don't vanish mid-flight.
+        result_extended=True,
     )
     CELERY_AVAILABLE = True
 except ImportError:

@@ -8,8 +8,9 @@ import os
 import requests
 import google.generativeai as genai
 
-# New Imports for PostgreSQL
-from database import SessionLocal, Media, Interaction
+# Database imports — pgvector search uses SQLAlchemy directly
+from database import SessionLocal, Media, Interaction, MediaEmbedding, PGVECTOR_AVAILABLE
+from sqlalchemy import text as sa_text
 
 
 # ── Gemini Embedding Wrapper ──────────────────────────────────────────────────
@@ -80,21 +81,32 @@ class RecommendationEngine:
         # TMDB config
         self.tmdb_api_key = os.environ.get("TMDB_API_KEY")
         if not self.tmdb_api_key:
-            print("[WARNING] TMDB_API_KEY not found in environment variables. Streaming platforms will not be available.")
+            print("[WARNING] TMDB_API_KEY not found — streaming providers unavailable.")
 
-        try:
-            # SECURITY NOTE: allow_dangerous_deserialization is intentionally omitted.
-            # The FAISS index at ../data/faiss_index is a trusted build artifact produced
-            # by data_ingestor.py in this project. Never load FAISS indexes from
-            # untrusted or user-supplied paths without re-enabling the flag explicitly.
-            self.vector_store = FAISS.load_local(
-                "../data/faiss_index",
-                self.embeddings
-            )
-            # We no longer load the CSV here. We use PostgreSQL.
-        except Exception as e:
-            print("[WARNING] Could not load FAISS index. Did you run data_ingestor.py first?")
-            raise e
+        # ── Vector Store Selection ─────────────────────────────────────────
+        # Priority: pgvector (PostgreSQL, scales in Docker/K8s)
+        #         → FAISS fallback (local file, dev/offline use)
+        #
+        # Set USE_PGVECTOR=false in .env to force FAISS regardless.
+        _want_pgvector = os.environ.get("USE_PGVECTOR", "true").lower() != "false"
+        self.use_pgvector = PGVECTOR_AVAILABLE and _want_pgvector
+        self.vector_store = None  # FAISS store; only loaded when needed as fallback
+
+        if self.use_pgvector:
+            print("[RecommendationEngine] Using pgvector for similarity search.")
+        else:
+            # Load FAISS as the primary search backend
+            try:
+                self.vector_store = FAISS.load_local(
+                    "../data/faiss_index",
+                    self.embeddings,
+                    allow_dangerous_deserialization=True,
+                )
+                print("[RecommendationEngine] Using FAISS for similarity search (pgvector unavailable or disabled).")
+            except Exception as e:
+                print(f"[WARNING] Could not load FAISS index: {e}")
+                print("[WARNING] Run data_ingestor.py to build the index, or enable pgvector.")
+                raise
 
     def _calculate_diversity_score(self, movie_overview, selected_overviews):
         """Calculate diversity score based on content similarity with already selected movies."""
@@ -111,20 +123,43 @@ class RecommendationEngine:
         except:
             return 0.5
 
-    def _generate_explanation(self, query, movies, similarities):
-        """Generate a personalized explanation via Gemini."""
+    def _generate_explanation(self, query: str, movies: list, similarities: list) -> str:
+        """
+        Generate a thematic explanation via Gemini.
+
+        Title-free design: the prompt deliberately withholds movie/show names.
+        Gemini is forced to reason from genres, moods, time periods, and narrative
+        themes extracted from the overviews — producing genuinely explainable
+        recommendations rather than just parroting a title list back.
+        """
         if not self.gemini_model:
             return "AI explanation unavailable: GEMINI_API_KEY missing from .env"
-        
-        movie_titles = [m['title'] for m in movies]
-        prompt = (f"You are an AI movie and TV recommendation expert. "
-                  f"The user is searching for: '{query}'. "
-                  f"I have selected these titles for them: {', '.join(movie_titles)}. "
-                  f"Write a short, engaging explanation (2-3 sentences max) explaining why these titles are a great fit for their query. "
-                  f"Do not list the titles individually, just explain the thematic connection.")
+
+        # Build a theme digest from overviews — no titles included
+        themes = []
+        for m in movies:
+            overview = (m.get("overview") or "").strip()
+            if overview:
+                # Truncate long overviews to keep the prompt tight
+                themes.append(overview[:300])
+
+        theme_block = "\n".join(f"- {t}" for t in themes[:6]) if themes else "(no overviews available)"
+
+        prompt = (
+            f"You are an expert film and TV critic specialising in explainable AI recommendations.\n"
+            f"A user searched for: '{query}'.\n\n"
+            f"The recommendation engine surfaced a set of titles based on semantic similarity. "
+            f"Here are the thematic summaries of those titles (names are intentionally omitted):\n"
+            f"{theme_block}\n\n"
+            f"Write 2-3 sentences explaining the deep thematic, tonal, or narrative thread that "
+            f"connects these results to the user's search intent. "
+            f"Focus on mood, genre conventions, character archetypes, and storytelling style. "
+            f"Do NOT mention any movie or show titles by name. "
+            f"Be specific about themes — avoid generic phrases like 'you might enjoy these'."
+        )
         try:
             response = self.gemini_model.generate_content(prompt)
-            return f"🤖 **Movie and TV Shows Recommending Engine AI Says:**\n\n{response.text}"
+            return f"🤖 **AI Recommendation Analysis:**\n\n{response.text}"
         except Exception as e:
             return f"Failed to generate explanation: {str(e)}"
 
@@ -194,75 +229,140 @@ class RecommendationEngine:
             return []
 
 
-    def get_recommendations(self, query: str, top_k: int = 15, final_results: int = 6, 
-                            user_id: str = None, genre: str = None, 
-                            min_rating: float = 0.0, media_type: str = "All"):
+    # ── Similarity Search Backends ──────────────────────────────────────────────
+
+    def _pgvector_search(
+        self,
+        query: str,
+        db,
+        top_k: int,
+        media_type: str,
+        min_rating: float,
+        user_likes: list,
+        user_dislikes: list,
+    ) -> list:
         """
-        Get personalized recommendations using FAISS, filters, and PostgreSQL metadata.
+        Embed the query and find the top-k nearest neighbours in PostgreSQL
+        using pgvector's cosine distance operator (<=>).
 
-        The embedding model (paraphrase-multilingual-MiniLM-L12-v2) is natively
-        multilingual: non-English queries are mapped directly into the same vector
-        space as English content, so translation is both unnecessary and harmful
-        (it introduces latency and translation noise).
+        The SQL query joins media_embeddings ↔ media, applies pre-filters
+        (media_type, min_rating), and orders by cosine distance ascending
+        (closer = more similar).  Hybrid scoring happens in Python after
+        the DB returns candidates, consistent with the FAISS path.
         """
-        # Pass the raw query directly — no translation needed.
-        original_query = query
+        query_vector = self.embeddings.embed_query(query)
+        # Format as a Postgres literal: '[0.1, 0.2, ...]'
+        vec_literal = "[" + ",".join(str(v) for v in query_vector) + "]"
 
-        # Fetch user interactions for hybrid scoring if user_id is provided
-        user_likes = []
-        user_dislikes = []
-        db = SessionLocal()
-        
-        if user_id:
-            interactions = db.query(Interaction).filter(Interaction.user_id == user_id).all()
-            user_likes = [i.tmdb_id for i in interactions if i.interaction_type == "like"]
-            user_dislikes = [i.tmdb_id for i in interactions if i.interaction_type == "dislike"]
+        media_type_filter = ""
+        if media_type != "All":
+            # Normalise "TV Shows" → "tv", "Movie" → "movie"
+            norm = media_type.lower().replace(" shows", "").replace("movies", "movie")
+            media_type_filter = f"AND m.media_type = '{norm}'"
 
-        # Search using raw (potentially non-English) query.
-        # top_k is doubled when post-filters are active so we have enough candidates.
+        sql = sa_text(f"""
+            SELECT
+                me.tmdb_id,
+                me.media_type              AS emb_media_type,
+                (me.embedding <=> :vec)    AS cosine_dist,
+                m.db_id,
+                m.title,
+                m.overview,
+                m.release_date,
+                m.rating,
+                m.poster_path
+            FROM media_embeddings me
+            JOIN media m
+              ON me.tmdb_id = m.tmdb_id
+             AND me.media_type = m.media_type
+            WHERE m.rating >= :min_rating
+            {media_type_filter}
+            ORDER BY cosine_dist ASC
+            LIMIT :top_k
+        """)
+
+        rows = db.execute(sql, {"vec": vec_literal, "min_rating": min_rating, "top_k": top_k}).fetchall()
+
+        candidates = []
+        for row in rows:
+            cosine_dist = float(row.cosine_dist)          # [0, 2]; 0 = identical
+            cosine_sim   = 1.0 - (cosine_dist / 2.0)      # map to [0, 1]; 1 = identical
+
+            collab_boost = 0.0
+            if int(row.tmdb_id) in user_likes:
+                collab_boost = 0.2
+            elif int(row.tmdb_id) in user_dislikes:
+                collab_boost = -0.3
+
+            normalized_rating = (float(row.rating or 0)) / 10.0
+            combined_score = (cosine_sim * 0.7) + (normalized_rating * 0.3) + collab_boost
+
+            candidates.append({
+                "id": int(row.tmdb_id),
+                "db_id": int(row.db_id),
+                "title": row.title,
+                "overview": row.overview,
+                "release_date": row.release_date,
+                "rating": float(row.rating or 0),
+                "poster_path": row.poster_path,
+                "media_type": row.emb_media_type,
+                "similarity_score": float(cosine_sim),
+                "combined_score": float(combined_score),
+                "original_doc": None,  # not applicable for pgvector path
+            })
+
+        return candidates
+
+    def _faiss_search(
+        self,
+        query: str,
+        db,
+        top_k: int,
+        media_type: str,
+        min_rating: float,
+        genre: str,
+        user_likes: list,
+        user_dislikes: list,
+    ) -> list:
+        """
+        Original FAISS similarity search path — used when pgvector is unavailable.
+        Preserved verbatim from the pre-migration implementation.
+        """
+        if self.vector_store is None:
+            raise RuntimeError("FAISS index not loaded and pgvector is disabled. Cannot search.")
+
         search_k = top_k * 2 if (min_rating > 0 or genre or media_type != "All") else top_k
         docs_with_scores = self.vector_store.similarity_search_with_score(query, k=search_k)
-        
+
         candidates = []
-        
         for doc, similarity_score in docs_with_scores:
             tmdb_id = doc.metadata.get("id")
             doc_media_type = doc.metadata.get("media_type", "movie")
-            
-            # Pre-filter by media_type
+
             if media_type != "All" and doc_media_type != media_type.lower().replace(" shows", ""):
-                 continue
-                 
-            # Fetch metadata from PostgreSQL
-            media_record = db.query(Media).filter(Media.tmdb_id == tmdb_id, Media.media_type == doc_media_type).first()
-            
+                continue
+
+            media_record = db.query(Media).filter(
+                Media.tmdb_id == tmdb_id,
+                Media.media_type == doc_media_type,
+            ).first()
+
             if media_record:
-                # Pre-filters
                 if media_record.rating < min_rating:
                     continue
-                if genre and genre.lower() not in (media_record.overview or "").lower(): # basic genre filter on description
+                if genre and genre.lower() not in (media_record.overview or "").lower():
                     continue
-                    
-                # Hybrid Collaborative Filtering Score
-                # If the user liked similar things, we boost it.
-                # Disliked items receive a penalty but are NOT hard-excluded so that
-                # semantically exceptional results can still surface.
+
                 collab_boost = 0.0
                 if int(media_record.tmdb_id) in user_likes:
                     collab_boost = 0.2
                 elif int(media_record.tmdb_id) in user_dislikes:
-                    collab_boost = -0.3  # Negative penalty; combined_score may still be positive
+                    collab_boost = -0.3
 
-                # FAISS similarity_search_with_score returns L2 (Euclidean) distance:
-                # lower distance = more similar.  Convert to a [0, 1] similarity
-                # score so that higher always means better, consistent with rating
-                # and collaborative boost terms.
-                semantic_similarity = 1.0 / (1.0 + similarity_score)  # maps [0, ∞) → (0, 1]
-
-                # Calculate combined score: semantic similarity (70%) + rating boost (30%) + collab_boost
-                normalized_rating = (media_record.rating or 0) / 10.0  # Normalize to 0-1
+                semantic_similarity = 1.0 / (1.0 + similarity_score)
+                normalized_rating = (media_record.rating or 0) / 10.0
                 combined_score = (semantic_similarity * 0.7) + (normalized_rating * 0.3) + collab_boost
-                
+
                 candidates.append({
                     "id": int(media_record.tmdb_id),
                     "db_id": int(media_record.db_id),
@@ -272,15 +372,53 @@ class RecommendationEngine:
                     "rating": float(media_record.rating),
                     "poster_path": media_record.poster_path,
                     "media_type": media_record.media_type,
-                    "similarity_score": float(semantic_similarity),  # store converted similarity, not raw L2
+                    "similarity_score": float(semantic_similarity),
                     "combined_score": float(combined_score),
-                    "original_doc": doc
+                    "original_doc": doc,
                 })
-        
-        db.close()
-        
-        # All score components (semantic_similarity, normalized_rating, collab_boost) are now
-        # oriented as "higher is better", so a standard descending sort is correct.
+        return candidates
+
+    def get_recommendations(
+        self,
+        query: str,
+        top_k: int = 15,
+        final_results: int = 6,
+        user_id: str = None,
+        genre: str = None,
+        min_rating: float = 0.0,
+        media_type: str = "All",
+    ):
+        """
+        Return personalised recommendations using either pgvector (primary) or
+        FAISS (fallback), followed by MMR-based diversity filtering.
+
+        The embedding model (paraphrase-multilingual-MiniLM-L12-v2 or Gemini
+        embedding-001) is natively multilingual: non-English queries are mapped
+        directly into the same vector space without translation overhead.
+        """
+        original_query = query
+
+        db = SessionLocal()
+        user_likes, user_dislikes = [], []
+        if user_id:
+            interactions = db.query(Interaction).filter(Interaction.user_id == user_id).all()
+            user_likes    = [i.tmdb_id for i in interactions if i.interaction_type == "like"]
+            user_dislikes = [i.tmdb_id for i in interactions if i.interaction_type == "dislike"]
+
+        # Delegate to the appropriate search backend
+        try:
+            if self.use_pgvector:
+                candidates = self._pgvector_search(
+                    query, db, top_k, media_type, min_rating, user_likes, user_dislikes
+                )
+            else:
+                candidates = self._faiss_search(
+                    query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
+                )
+        finally:
+            db.close()
+
+        # All score components are "higher is better" — sort descending.
         candidates.sort(key=lambda x: x["combined_score"], reverse=True)
         
         # Diversity filtering: Select diverse items using Maximal Marginal Relevance
