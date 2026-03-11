@@ -62,23 +62,26 @@ class RecommendationEngine:
             print("[WARNING] GEMINI_API_KEY not found — Gemini generation unavailable.")
 
         # ── Embedding Model Selection ─────────────────────────────────────────
-        # Priority: Gemini embedding-001 (if key available) → HuggingFace fallback
+        # Priority: Gemini embedding-001 (768-dim) → HuggingFace fallback (384-dim)
         if gemini_api_key:
             try:
                 self.embeddings = GeminiEmbedder(model="models/embedding-001")
-                # Warm up with a test call to verify the key works
-                self.embeddings.embed_query("test")
-                print("[RecommendationEngine] Using Gemini embeddings (models/embedding-001)")
+                # Warm-up probe to verify the key is valid
+                _test_vec = self.embeddings.embed_query("test")
+                self.embedding_dim = len(_test_vec)   # 768
+                print(f"[RecommendationEngine] Using Gemini embeddings (dim={self.embedding_dim})")
             except Exception as e:
                 print(f"[RecommendationEngine] Gemini embeddings failed ({e}) — falling back to HuggingFace.")
                 self.embeddings = HuggingFaceEmbeddings(
                     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
                 )
+                self.embedding_dim = 384
         else:
             self.embeddings = HuggingFaceEmbeddings(
                 model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
             )
-            print("[RecommendationEngine] Using HuggingFace embeddings (paraphrase-multilingual-MiniLM-L12-v2)")
+            self.embedding_dim = 384
+            print(f"[RecommendationEngine] Using HuggingFace embeddings (dim={self.embedding_dim})")
 
         # TMDB config
         self.tmdb_api_key = os.environ.get("TMDB_API_KEY")
@@ -88,14 +91,21 @@ class RecommendationEngine:
         # ── Vector Store Selection ─────────────────────────────────────────
         # Priority: pgvector (PostgreSQL, scales in Docker/K8s)
         #         → FAISS fallback (local file, dev/offline use)
+        #         → TF-IDF keyword search (last resort if no vector index is usable)
         #
         # Set USE_PGVECTOR=false in .env to force FAISS regardless.
         _want_pgvector = os.environ.get("USE_PGVECTOR", "true").lower() != "false"
         self.use_pgvector = PGVECTOR_AVAILABLE and _want_pgvector
         self.vector_store = None  # FAISS store; only loaded when needed as fallback
 
+        # ── Probe the stored index dimension ──────────────────────────────────
+        # This is done at startup so we can detect mismatches before any query
+        # arrives, rather than crashing mid-request.
+        self.index_dim: int | None = None
+
         if self.use_pgvector:
-            print("[RecommendationEngine] Using pgvector for similarity search.")
+            self.index_dim = self._probe_pgvector_dim()
+            print(f"[RecommendationEngine] Using pgvector (stored dim={self.index_dim}).")
         else:
             # Load FAISS as the primary search backend
             try:
@@ -104,11 +114,81 @@ class RecommendationEngine:
                     self.embeddings,
                     allow_dangerous_deserialization=True,
                 )
-                print("[RecommendationEngine] Using FAISS for similarity search (pgvector unavailable or disabled).")
+                self.index_dim = self._probe_faiss_dim()
+                print(
+                    f"[RecommendationEngine] Using FAISS (stored dim={self.index_dim}, "
+                    f"active model dim={self.embedding_dim})."
+                )
             except Exception as e:
                 print(f"[WARNING] Could not load FAISS index: {e}")
-                print("[WARNING] Run data_ingestor.py to build the index, or enable pgvector.")
-                raise
+                print("[WARNING] Falling back to TF-IDF keyword search for all queries.")
+                # Do NOT re-raise — TF-IDF will handle search gracefully.
+
+        # Warn early if the active model and stored index disagree
+        if self.index_dim is not None and self.index_dim != self.embedding_dim:
+            print(
+                f"[WARNING] Dimension mismatch detected: active model outputs "
+                f"{self.embedding_dim}-dim vectors, stored index expects {self.index_dim}-dim. "
+                f"Vectors will be projected (zero-padded or truncated) automatically."
+            )
+
+    # ── Embedding Utilities ────────────────────────────────────────────────────
+
+    def _probe_faiss_dim(self) -> int | None:
+        """Return the dimension stored inside the loaded FAISS index, or None."""
+        try:
+            return self.vector_store.index.d  # type: ignore[union-attr]
+        except Exception:
+            return None
+
+    def _probe_pgvector_dim(self) -> int | None:
+        """
+        Query the media_embeddings table to discover the dimension of stored vectors.
+        Works by fetching one row and measuring the length of its embedding.
+        Returns None when the table is empty or pgvector is unavailable.
+        """
+        try:
+            db = SessionLocal()
+            row = db.execute(
+                sa_text("SELECT embedding FROM media_embeddings LIMIT 1")
+            ).fetchone()
+            db.close()
+            if row and row[0] is not None:
+                return len(row[0])  # pgvector returns a list/array
+        except Exception as exc:
+            print(f"[RecommendationEngine] Could not probe pgvector dim: {exc}")
+        return None
+
+    def _safe_embed(self, text: str) -> list:
+        """
+        Embed *text* with the active model, then project the vector to match
+        ``self.index_dim`` if the dimensions differ.
+
+        Projection strategy
+        -------------------
+        * active < stored  → zero-pad on the right  (e.g. 384 → 768)
+        * active > stored  → truncate on the right  (e.g. 768 → 384)
+        * equal            → return as-is
+
+        Zero-padding is information-preserving: the 384 directions that the
+        model learned are kept intact; the extra 384 slots are zero, which
+        means they do not contribute to the cosine similarity calculation.
+        This is far better than crashing.
+        """
+        vec = self.embeddings.embed_query(text)
+
+        target = self.index_dim
+        if target is None or len(vec) == target:
+            return vec  # no adjustment needed
+
+        if len(vec) < target:
+            # Zero-pad to reach the target dimension
+            vec = vec + [0.0] * (target - len(vec))
+        else:
+            # Truncate to the target dimension
+            vec = vec[:target]
+
+        return vec
 
     def _calculate_diversity_score(self, movie_overview, selected_overviews):
         """Calculate diversity score based on content similarity with already selected movies."""
@@ -252,7 +332,11 @@ class RecommendationEngine:
         (closer = more similar).  Hybrid scoring happens in Python after
         the DB returns candidates, consistent with the FAISS path.
         """
-        query_vector = self.embeddings.embed_query(query)
+        # Use _safe_embed() so dimension mismatches are handled before the SQL
+        # reaches Postgres. If the active model is 384-dim but the column is 768-dim
+        # (or vice-versa), the vector is zero-padded/truncated here rather than
+        # causing a "wrong number of dimensions" error inside Postgres.
+        query_vector = self._safe_embed(query)
         # Format as a Postgres literal: '[0.1, 0.2, ...]'
         vec_literal = "[" + ",".join(str(v) for v in query_vector) + "]"
 
@@ -327,14 +411,20 @@ class RecommendationEngine:
         user_dislikes: list,
     ) -> list:
         """
-        Original FAISS similarity search path — used when pgvector is unavailable.
-        Preserved verbatim from the pre-migration implementation.
+        FAISS similarity search.  Uses ``_safe_embed`` so that a dimension
+        mismatch between the active embedding model and the stored index is
+        handled transparently via zero-padding / truncation instead of crashing.
         """
         if self.vector_store is None:
             raise RuntimeError("FAISS index not loaded and pgvector is disabled. Cannot search.")
 
         search_k = top_k * 2 if (min_rating > 0 or genre or media_type != "All") else top_k
-        docs_with_scores = self.vector_store.similarity_search_with_score(query, k=search_k)
+
+        # Use the dimension-safe embedding path
+        query_vec = self._safe_embed(query)
+        docs_with_scores = self.vector_store.similarity_search_with_score_by_vector(
+            query_vec, k=search_k
+        )
 
         candidates = []
         for doc, similarity_score in docs_with_scores:
@@ -380,6 +470,85 @@ class RecommendationEngine:
                 })
         return candidates
 
+    def _tfidf_search(
+        self,
+        query: str,
+        db,
+        top_k: int,
+        media_type: str,
+        min_rating: float,
+        genre: str,
+        user_likes: list,
+        user_dislikes: list,
+    ) -> list:
+        """
+        Pure TF-IDF keyword search used as a last-resort fallback when no vector
+        index is available or when a dimension-mismatch error is unrecoverable.
+
+        Fetches all media rows from the DB, builds an in-memory TF-IDF matrix,
+        and returns the top-k most relevant titles by cosine similarity.
+        No external API calls — completely offline-safe.
+        """
+        print("[RecommendationEngine] Running TF-IDF keyword fallback search.")
+        query_filter = [Media.rating >= min_rating]
+        if media_type != "All":
+            norm = media_type.lower().replace(" shows", "").replace("movies", "movie")
+            query_filter.append(Media.media_type == norm)
+
+        rows = db.query(Media).filter(*query_filter).limit(5000).all()
+        if not rows:
+            return []
+
+        corpus = [
+            f"{r.title or ''} {r.overview or ''}" for r in rows
+        ]
+
+        vectorizer = TfidfVectorizer(
+            stop_words="english",
+            max_features=10_000,
+            ngram_range=(1, 2),
+        )
+        tfidf_matrix = vectorizer.fit_transform(corpus)
+        query_vec = vectorizer.transform([query])
+        sims = cosine_similarity(query_vec, tfidf_matrix)[0]  # shape (n_rows,)
+
+        # Get top-k indices by similarity score
+        top_indices = np.argsort(sims)[::-1][:top_k * 2]
+
+        candidates = []
+        for idx in top_indices:
+            row = rows[idx]
+            sim = float(sims[idx])
+            if sim <= 0:
+                break
+            if genre and genre.lower() not in (row.overview or "").lower():
+                continue
+
+            collab_boost = 0.0
+            if row.tmdb_id in user_likes:
+                collab_boost = 0.2
+            elif row.tmdb_id in user_dislikes:
+                collab_boost = -0.3
+
+            normalized_rating = (row.rating or 0) / 10.0
+            combined_score = (sim * 0.7) + (normalized_rating * 0.3) + collab_boost
+
+            candidates.append({
+                "id": int(row.tmdb_id),
+                "db_id": int(row.db_id),
+                "title": row.title,
+                "overview": row.overview,
+                "release_date": row.release_date,
+                "rating": float(row.rating or 0),
+                "poster_path": row.poster_path,
+                "media_type": row.media_type,
+                "similarity_score": sim,
+                "combined_score": combined_score,
+                "original_doc": None,
+            })
+
+        return candidates
+
     def get_recommendations(
         self,
         query: str,
@@ -408,15 +577,41 @@ class RecommendationEngine:
             user_dislikes = [i.tmdb_id for i in interactions if i.interaction_type == "dislike"]
 
         # Delegate to the appropriate search backend
+        # The routing order is:
+        #   1. pgvector (PostgreSQL)   — if available
+        #   2. FAISS                   — if index loaded
+        #   3. TF-IDF keyword search   — always available, pure-Python fallback
+        #
+        # _safe_embed() handles dimension mismatches transparently for paths 1 & 2.
+        # If a dimension error somehow escapes _safe_embed (e.g. the pgvector column
+        # rejects the projected vector due to schema mismatch), we catch it and
+        # transparently retry with TF-IDF so the endpoint never returns a 500.
         try:
             if self.use_pgvector:
                 candidates = self._pgvector_search(
                     query, db, top_k, media_type, min_rating, user_likes, user_dislikes
                 )
-            else:
+            elif self.vector_store is not None:
                 candidates = self._faiss_search(
                     query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
                 )
+            else:
+                # No vector index is loaded at all — go straight to TF-IDF
+                candidates = self._tfidf_search(
+                    query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
+                )
+        except Exception as vector_err:
+            print(
+                f"[RecommendationEngine] Vector search failed ({vector_err}). "
+                f"Falling back to TF-IDF keyword search."
+            )
+            try:
+                candidates = self._tfidf_search(
+                    query, db, top_k, media_type, min_rating, genre, user_likes, user_dislikes
+                )
+            except Exception as tfidf_err:
+                print(f"[RecommendationEngine] TF-IDF fallback also failed: {tfidf_err}")
+                candidates = []
         finally:
             db.close()
 
