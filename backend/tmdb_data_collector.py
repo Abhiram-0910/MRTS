@@ -7,78 +7,138 @@ from typing import List, Dict, Optional
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+    wait_fixed,
+    before_sleep_log,
+    RetryError,
+)
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class _RateLimitError(Exception):
+    """
+    Raised internally by ``_tmdb_get`` when TMDB returns HTTP 429.
+    tenacity catches this class and applies the configured wait strategy.
+    """
+    def __init__(self, retry_after: float = 0.0):
+        self.retry_after = retry_after
+        super().__init__(f"TMDB rate-limited (Retry-After: {retry_after}s)")
+
 class TMDBDataCollector:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.themoviedb.org/3"
         self.image_base_url = "https://image.tmdb.org/t/p/w500"
-        
+
+    # ── Core HTTP helper ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _retry_wait(retry_state) -> float:
+        """
+        Custom tenacity wait function.
+
+        If the last exception was a ``_RateLimitError`` and TMDB supplied a
+        ``Retry-After`` header, sleep for exactly that many seconds.
+        Otherwise fall back to full-jitter exponential backoff (1-60 s).
+        """
+        exc = retry_state.outcome.exception()
+        if isinstance(exc, _RateLimitError) and exc.retry_after > 0:
+            print(f"[TMDB] Rate limited. Honouring Retry-After: {exc.retry_after}s")
+            return exc.retry_after
+        # Exponential backoff: 2^attempt seconds, capped at 60, with jitter
+        exp = wait_exponential(multiplier=1, min=2, max=60)
+        return exp(retry_state)
+
+    def _tmdb_get(self, url: str, params: dict) -> requests.Response:
+        """
+        Central GET helper with tenacity-powered retry logic.
+
+        Retry policy
+        ------------
+        * Catches only ``_RateLimitError`` (HTTP 429) and transient network
+          errors (``requests.exceptions.RequestException``).
+        * Up to 6 attempts total.
+        * Wait time: ``Retry-After`` header value when present, else
+          exponential backoff (2-60 s).
+        * Raises ``RetryError`` after exhausting all attempts.
+        """
+        @retry(
+            retry=retry_if_exception_type((_RateLimitError, requests.exceptions.RequestException)),
+            stop=stop_after_attempt(6),
+            wait=self._retry_wait,
+            reraise=False,
+            before_sleep=before_sleep_log(logger, logging.WARNING),
+        )
+        def _get() -> requests.Response:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 429:
+                # Parse Retry-After if available (TMDB sends it as an integer)
+                retry_after = float(resp.headers.get("Retry-After", 0))
+                raise _RateLimitError(retry_after=retry_after)
+            return resp
+
+        return _get()
+
     def get_trending_movies(self, time_window: str = "week", page: int = 1) -> List[Dict]:
-        """Get trending movies from TMDB"""
+        """Get trending movies from TMDB."""
         url = f"{self.base_url}/trending/movie/{time_window}"
         params = {"api_key": self.api_key, "page": page}
-        
         try:
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                return response.json().get("results", [])
-            else:
-                print(f"Error fetching trending movies: {response.status_code}")
-                return []
-        except Exception as e:
-            print(f"Exception in get_trending_movies: {e}")
-            return []
-    
+            resp = self._tmdb_get(url, params)
+            if resp.status_code == 200:
+                return resp.json().get("results", [])
+            print(f"Error fetching trending movies: {resp.status_code}")
+        except Exception as exc:
+            print(f"Exception in get_trending_movies: {exc}")
+        return []
+
     def get_trending_tv_shows(self, time_window: str = "week", page: int = 1) -> List[Dict]:
-        """Get trending TV shows from TMDB"""
+        """Get trending TV shows from TMDB."""
         url = f"{self.base_url}/trending/tv/{time_window}"
         params = {"api_key": self.api_key, "page": page}
-        
         try:
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                return response.json().get("results", [])
-            else:
-                print(f"Error fetching trending TV shows: {response.status_code}")
-                return []
-        except Exception as e:
-            print(f"Exception in get_trending_tv_shows: {e}")
-            return []
-    
+            resp = self._tmdb_get(url, params)
+            if resp.status_code == 200:
+                return resp.json().get("results", [])
+            print(f"Error fetching trending TV shows: {resp.status_code}")
+        except Exception as exc:
+            print(f"Exception in get_trending_tv_shows: {exc}")
+        return []
+
     def get_movie_details(self, movie_id: int) -> Optional[Dict]:
-        """Get detailed movie information"""
+        """Get detailed movie information."""
         url = f"{self.base_url}/movie/{movie_id}"
         params = {"api_key": self.api_key, "append_to_response": "credits,keywords,watch/providers"}
-        
         try:
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                print(f"Error fetching movie details for {movie_id}: {response.status_code}")
-                return None
-        except Exception as e:
-            print(f"Exception in get_movie_details: {e}")
-            return None
-    
+            resp = self._tmdb_get(url, params)
+            if resp.status_code == 200:
+                return resp.json()
+            print(f"Error fetching movie details for {movie_id}: {resp.status_code}")
+        except Exception as exc:
+            print(f"Exception in get_movie_details({movie_id}): {exc}")
+        return None
+
     def get_tv_show_details(self, tv_id: int) -> Optional[Dict]:
-        """Get detailed TV show information"""
+        """Get detailed TV show information."""
         url = f"{self.base_url}/tv/{tv_id}"
         params = {"api_key": self.api_key, "append_to_response": "credits,keywords,watch/providers"}
-        
         try:
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                print(f"Error fetching TV show details for {tv_id}: {response.status_code}")
-                return None
-        except Exception as e:
-            print(f"Exception in get_tv_show_details: {e}")
-            return None
-    
+            resp = self._tmdb_get(url, params)
+            if resp.status_code == 200:
+                return resp.json()
+            print(f"Error fetching TV show details for {tv_id}: {resp.status_code}")
+        except Exception as exc:
+            print(f"Exception in get_tv_show_details({tv_id}): {exc}")
+        return None
+
     def discover_movies(self, page: int = 1, year_min: int = 2000, vote_min: float = 6.0) -> List[Dict]:
-        """Discover movies based on criteria"""
+        """Discover movies based on criteria."""
         url = f"{self.base_url}/discover/movie"
         params = {
             "api_key": self.api_key,
@@ -86,22 +146,19 @@ class TMDBDataCollector:
             "primary_release_date.gte": f"{year_min}-01-01",
             "vote_average.gte": vote_min,
             "sort_by": "popularity.desc",
-            "with_original_language": "en,hi,te,ta,es,fr,de,it,ja,ko,zh"
+            "with_original_language": "en,hi,te,ta,es,fr,de,it,ja,ko,zh",
         }
-        
         try:
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                return response.json().get("results", [])
-            else:
-                print(f"Error discovering movies: {response.status_code}")
-                return []
-        except Exception as e:
-            print(f"Exception in discover_movies: {e}")
-            return []
-    
+            resp = self._tmdb_get(url, params)
+            if resp.status_code == 200:
+                return resp.json().get("results", [])
+            print(f"Error discovering movies: {resp.status_code}")
+        except Exception as exc:
+            print(f"Exception in discover_movies: {exc}")
+        return []
+
     def discover_tv_shows(self, page: int = 1, year_min: int = 2000, vote_min: float = 6.0) -> List[Dict]:
-        """Discover TV shows based on criteria"""
+        """Discover TV shows based on criteria."""
         url = f"{self.base_url}/discover/tv"
         params = {
             "api_key": self.api_key,
@@ -109,20 +166,17 @@ class TMDBDataCollector:
             "first_air_date.gte": f"{year_min}-01-01",
             "vote_average.gte": vote_min,
             "sort_by": "popularity.desc",
-            "with_original_language": "en,hi,te,ta,es,fr,de,it,ja,ko,zh"
+            "with_original_language": "en,hi,te,ta,es,fr,de,it,ja,ko,zh",
         }
-        
         try:
-            response = requests.get(url, params=params)
-            if response.status_code == 200:
-                return response.json().get("results", [])
-            else:
-                print(f"Error discovering TV shows: {response.status_code}")
-                return []
-        except Exception as e:
-            print(f"Exception in discover_tv_shows: {e}")
-            return []
-    
+            resp = self._tmdb_get(url, params)
+            if resp.status_code == 200:
+                return resp.json().get("results", [])
+            print(f"Error discovering TV shows: {resp.status_code}")
+        except Exception as exc:
+            print(f"Exception in discover_tv_shows: {exc}")
+        return []
+
     def extract_genres(self, genres: List[Dict]) -> List[str]:
         """Extract genre names from genre objects"""
         return [genre["name"] for genre in genres if "name" in genre]
@@ -208,87 +262,97 @@ class TMDBDataCollector:
         }
     
     def collect_comprehensive_dataset(self, target_size: int = 10000, batch_size: int = 20) -> pd.DataFrame:
-        """Collect comprehensive dataset with movies and TV shows"""
-        all_media = []
-        
+        """Collect comprehensive dataset with movies and TV shows."""
+        all_media: list = []
+
         print(f"Starting comprehensive data collection targeting {target_size} titles...")
-        
-        # Collect trending content first (high quality, recent)
+
+        # ── Trending content (high quality, recent) ───────────────────────────
         print("Collecting trending movies and TV shows...")
-        trending_movies = []
-        trending_tv = []
-        
+        trending_movies: list = []
+        trending_tv: list = []
+
         for page in range(1, 6):  # 5 pages of trending content
+            # No sleep needed — _tmdb_get retries with Retry-After when rate-limited
             trending_movies.extend(self.get_trending_movies("week", page))
             trending_tv.extend(self.get_trending_tv_shows("week", page))
-            time.sleep(0.5)  # Rate limiting
-        
+
         print(f"Found {len(trending_movies)} trending movies and {len(trending_tv)} trending TV shows")
-        
-        # Collect discover content (diverse, high-rated)
+
+        # ── Discovery content (diverse, high-rated) ───────────────────────────
         print("Discovering high-rated movies and TV shows...")
-        discovered_movies = []
-        discovered_tv = []
-        
+        discovered_movies: list = []
+        discovered_tv: list = []
+
         for page in range(1, 21):  # 20 pages of discovered content
             discovered_movies.extend(self.discover_movies(page, year_min=2010, vote_min=7.0))
             discovered_tv.extend(self.discover_tv_shows(page, year_min=2010, vote_min=7.0))
             if page % 5 == 0:
                 print(f"Completed {page} pages of discovery...")
-                time.sleep(1)  # Rate limiting
-        
+            # No sleep here — tenacity handles rate limits inside each call
+
         print(f"Found {len(discovered_movies)} discovered movies and {len(discovered_tv)} discovered TV shows")
-        
-        # Combine and deduplicate
-        all_movie_ids = list(set([m["id"] for m in trending_movies + discovered_movies]))
-        all_tv_ids = list(set([t["id"] for t in trending_tv + discovered_tv]))
-        
+
+        # Combine and deduplicate by TMDB ID
+        all_movie_ids = list(set(m["id"] for m in trending_movies + discovered_movies))
+        all_tv_ids    = list(set(t["id"] for t in trending_tv    + discovered_tv))
+
         print(f"Processing {len(all_movie_ids)} unique movies and {len(all_tv_ids)} unique TV shows")
-        
-        # Process movies in batches
+
+        # ── Process movies in parallel ────────────────────────────────────────
         print("Processing movie details...")
         with ThreadPoolExecutor(max_workers=5) as executor:
-            movie_futures = [executor.submit(self.get_movie_details, movie_id) for movie_id in all_movie_ids[:5000]]
-            
+            movie_futures = [
+                executor.submit(self.get_movie_details, mid)
+                for mid in all_movie_ids[:5000]
+            ]
             for future in as_completed(movie_futures):
                 movie_data = future.result()
-                if movie_data and movie_data.get("overview") and movie_data.get("vote_average", 0) > 5.0:
-                    processed_movie = self.process_movie_data(movie_data)
-                    all_media.append(processed_movie)
-                time.sleep(0.1)
-        
-        # Process TV shows in batches
+                if (
+                    movie_data
+                    and movie_data.get("overview")
+                    and movie_data.get("vote_average", 0) > 5.0
+                ):
+                    all_media.append(self.process_movie_data(movie_data))
+                # No time.sleep — rate-limit retries happen inside get_movie_details
+
+        # ── Process TV shows in parallel ──────────────────────────────────────
         print("Processing TV show details...")
         with ThreadPoolExecutor(max_workers=5) as executor:
-            tv_futures = [executor.submit(self.get_tv_show_details, tv_id) for tv_id in all_tv_ids[:5000]]
-            
+            tv_futures = [
+                executor.submit(self.get_tv_show_details, tid)
+                for tid in all_tv_ids[:5000]
+            ]
             for future in as_completed(tv_futures):
                 tv_data = future.result()
-                if tv_data and tv_data.get("overview") and tv_data.get("vote_average", 0) > 5.0:
-                    processed_tv = self.process_tv_show_data(tv_data)
-                    all_media.append(processed_tv)
-                time.sleep(0.1)
-        
+                if (
+                    tv_data
+                    and tv_data.get("overview")
+                    and tv_data.get("vote_average", 0) > 5.0
+                ):
+                    all_media.append(self.process_tv_show_data(tv_data))
+                # No time.sleep — rate-limit retries happen inside get_tv_show_details
+
         print(f"Successfully processed {len(all_media)} titles")
-        
+
         # Convert to DataFrame
         df = pd.DataFrame(all_media)
-        
+
         # Add additional metadata
         df["popularity_score"] = df["popularity"].fillna(0)
-        df["trending_score"] = 0.0
-        df["last_updated"] = datetime.utcnow()
-        
+        df["trending_score"]   = 0.0
+        df["last_updated"]     = datetime.utcnow()
+
         # Sort by popularity and rating
         df = df.sort_values(["popularity_score", "rating"], ascending=[False, False])
-        
+
         # Limit to target size
         if len(df) > target_size:
             df = df.head(target_size)
-        
+
         print(f"Final dataset contains {len(df)} titles")
         return df
-    
+
     def save_dataset(self, df: pd.DataFrame, output_path: str = "../data/enhanced_dataset.csv"):
         """Save the collected dataset to CSV"""
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
