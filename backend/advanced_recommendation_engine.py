@@ -189,6 +189,12 @@ class AdvancedRecommendationEngine:
         if isinstance(keywords, list):
             text_parts.append(" ".join(keywords[:10]))
         text_parts.append(item.get("overview", "")[:300])
+
+        # Append aggregated review snippets to enrich the embedding with critic/user sentiment
+        reviews_text = item.get("reviews_text", "") or ""
+        if reviews_text.strip():
+            text_parts.append(reviews_text.strip()[:200])
+
         text = ". ".join(p for p in text_parts if p)
 
         if self.embeddings_model and text.strip():
@@ -198,11 +204,11 @@ class AdvancedRecommendationEngine:
             except Exception:
                 pass
 
-        # Fallback: deterministic hash-based pseudo-embedding (never random)
-        np.random.seed(hash(text) % (2**31))
-        pseudo = np.random.rand(384).astype(np.float32)
-        np.random.seed(None)  # Reset seed
-        return pseudo
+        # Fallback: return a zero vector when no embedding model is available.
+        # A zero vector contributes 0.0 to cosine similarity scores (neutral/no signal),
+        # which is far safer than a random or hash-based pseudo-embedding that would
+        # corrupt similarity ranking results unpredictably.
+        return np.zeros(384, dtype=np.float32)
 
     def _calculate_quality_boost(self, item: Dict) -> float:
         quality_score = 0.0

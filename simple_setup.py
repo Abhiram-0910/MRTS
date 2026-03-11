@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MIRAI AI Simple Setup Script
+Movie and TV Shows Recommending Engine AI Simple Setup Script
 Quick setup for the revolutionary movie recommendation system
 """
 
@@ -31,7 +31,7 @@ def run_command(cmd, description=""):
 
 def main():
     """Main setup function"""
-    print("🤖 MIRAI AI Simple Setup")
+    print("🤖 Movie and TV Shows Recommending Engine AI Simple Setup")
     print("=" * 50)
     
     project_root = Path(__file__).parent
@@ -48,7 +48,7 @@ def main():
     env_file = project_root / ".env"
     if not env_file.exists():
         print("⚙️  Creating .env file...")
-        env_content = f"""# MIRAI AI Configuration
+        env_content = f"""# Movie and TV Shows Recommending Engine AI Configuration
 # Add your API keys here:
 GEMINI_API_KEY=your_gemini_api_key_here
 TMDB_API_KEY=your_tmdb_api_key_here
@@ -95,7 +95,7 @@ DEBUG=true
     # Windows batch file
     with open("start_mirai.bat", "w") as f:
         f.write("""@echo off
-echo Starting MIRAI AI...
+echo Starting Movie and TV Shows Recommending Engine AI...
 
 REM Start backend
 echo Starting backend server...
@@ -112,7 +112,7 @@ streamlit run enhanced_app.py
     with open("start_mirai.sh", "w") as f:
         f.write("""#!/bin/bash
 
-echo "Starting MIRAI AI..."
+echo "Starting Movie and TV Shows Recommending Engine AI..."
 
 # Start backend
 echo "Starting backend server..."
@@ -140,7 +140,7 @@ trap "kill $BACKEND_PID" EXIT
     
     # Step 6: Final instructions
     print("\n" + "=" * 50)
-    print("🎉 MIRAI AI Setup Complete!")
+    print("🎉 Movie and TV Shows Recommending Engine AI Setup Complete!")
     print("=" * 50)
     print()
     print("📋 Next Steps:")
@@ -148,7 +148,7 @@ trap "kill $BACKEND_PID" EXIT
     print("   - GEMINI_API_KEY: Get from Google AI Studio")
     print("   - TMDB_API_KEY: Get from The Movie Database")
     print()
-    print("🚀 To start MIRAI AI:")
+    print("🚀 To start Movie and TV Shows Recommending Engine AI:")
     if os.name == 'nt':
         print("   Run: start_mirai.bat")
     else:
@@ -172,7 +172,7 @@ trap "kill $BACKEND_PID" EXIT
     print()
     print("❓ Need help? Check the README.md file")
     print()
-    print("🌟 Enjoy MIRAI AI - Your revolutionary movie discovery engine!")
+    print("🌟 Enjoy Movie and TV Shows Recommending Engine AI - Your revolutionary movie discovery engine!")
 
 if __name__ == "__main__":
     try:

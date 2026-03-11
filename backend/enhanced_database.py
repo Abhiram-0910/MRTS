@@ -92,6 +92,9 @@ class Media(Base):
     trending_score = Column(Float, default=0.0)
     last_updated = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # Aggregated review text for embedding enrichment (critic + user snippets)
+    reviews_text = Column(Text, nullable=True)
+
     # Relationships
     platforms = relationship("StreamingPlatform", secondary=media_platforms, back_populates="media")
     interactions = relationship("EnhancedInteraction", back_populates="media")

@@ -104,7 +104,7 @@ User Profile:
         query_analysis = self._analyze_query_intent(query)
         
         prompt = f"""
-You are MIRAI, an advanced AI movie and TV show recommendation expert with deep understanding of cinema, storytelling, and user preferences.
+You are Movie and TV Shows Recommending Engine, an advanced AI movie and TV show recommendation expert with deep understanding of cinema, storytelling, and user preferences.
 
 USER QUERY: "{query}"
 
@@ -174,7 +174,7 @@ EXPLANATION:
         explanation = explanation.replace("These titles", "🎭 These titles")
         
         # Add signature
-        explanation += f"\n\n✨ **MIRAI AI Analysis** - Personalized for your search: \"{query}\""
+        explanation += f"\n\n✨ **Movie and TV Shows Recommending Engine AI Analysis** - Personalized for your search: \"{query}\""
         
         return explanation
     

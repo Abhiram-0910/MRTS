@@ -1,5 +1,9 @@
+import os
 import streamlit as st
 import requests
+
+# Backend base URL — override with BACKEND_URL env var for non-local deployments.
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
 st.set_page_config(page_title="Movie Discovery Engine", layout="wide")
 
@@ -163,7 +167,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("MIRAI ENGINE")
+st.title("Movie and TV Shows Recommending Engine ENGINE")
 st.markdown("<p class='subtitle'>The Next Generation of AI Movie & TV Show Discovery.</p>", unsafe_allow_html=True)
 
 # Sidebar with info and filters
@@ -208,7 +212,7 @@ if st.button("🔍 Find Movies", type="primary"):
                 }
                 
                 response = requests.post(
-                    "http://127.0.0.1:8000/api/recommend", 
+                    f"{BACKEND_URL}/api/recommend", 
                     json=payload
                 )
                 
@@ -228,8 +232,8 @@ if st.button("🔍 Find Movies", type="primary"):
                         with st.container():
                             st.markdown(
                                 f"<div class='ai-box'>"
-                                f"<strong>🤖 MIRAI Analysis:</strong><br><br>"
-                                f"{explanation.replace(chr(10), '<br>').replace('🤖 **MIRAI AI Says:**<br><br>', '')}"
+                                f"<strong>🤖 Movie and TV Shows Recommending Engine Analysis:</strong><br><br>"
+                                f"{explanation.replace(chr(10), '<br>').replace('🤖 **Movie and TV Shows Recommending Engine AI Says:**<br><br>', '')}"
                                 f"</div>", 
                                 unsafe_allow_html=True
                             )
@@ -286,14 +290,14 @@ if st.button("🔍 Find Movies", type="primary"):
                                     with btn_cols[0]:
                                         if st.button("🔥 Love it", key=f"like_{movie['id']}", use_container_width=True):
                                             requests.post(
-                                                "http://127.0.0.1:8000/api/rate",
+                                                f"{BACKEND_URL}/api/rate",
                                                 json={"user_id": user_id, "tmdb_id": movie['id'], "interaction_type": "like"}
                                             )
                                             st.toast(f"Loved '{movie['title']}'! We will show you more like this.", icon="🔥")
                                     with btn_cols[1]:
                                         if st.button("👎 Hard Pass", key=f"dislike_{movie['id']}", use_container_width=True):
                                             requests.post(
-                                                "http://127.0.0.1:8000/api/rate",
+                                                f"{BACKEND_URL}/api/rate",
                                                 json={"user_id": user_id, "tmdb_id": movie['id'], "interaction_type": "dislike"}
                                             )
                                             st.toast(f"Passed on '{movie['title']}'. We've updated your preferences.", icon="👎")

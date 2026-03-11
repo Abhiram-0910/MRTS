@@ -1,5 +1,5 @@
 """
-enhanced_main.py — MIRAI FastAPI Backend (Production-Grade)
+enhanced_main.py — Movie and TV Shows Recommending Engine FastAPI Backend (Production-Grade)
 Fixes applied:
  - Real query embedding (not random) wired into hybrid scoring
  - FAISS metadata key 'tmdb_id' (not 'id') for DB lookup
@@ -8,7 +8,7 @@ Fixes applied:
  - AdvancedRecommendationEngine receives embeddings model reference
  - Correct interaction endpoint (/api/interact)
 """
-from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, Depends, HTTPException, BackgroundTasks, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
@@ -34,6 +34,50 @@ import numpy as np
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
+# ── Auth & Rate Limiting ──────────────────────────────────────────────────────
+from auth import get_current_user, require_admin, router as auth_router
+
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.util import get_remote_address
+    from slowapi.errors import RateLimitExceeded
+    limiter = Limiter(key_func=get_remote_address)
+    SLOWAPI_AVAILABLE = True
+except ImportError:
+    class RateLimitExceeded(Exception): pass
+    limiter = None
+    SLOWAPI_AVAILABLE = False
+    print("[WARNING] slowapi not installed — rate limiting disabled.")
+
+# ── Optional Redis Cache ──────────────────────────────────────────────────────
+try:
+    import redis as redis_lib
+    _redis_client = redis_lib.Redis(
+        host=os.getenv("REDIS_HOST", "localhost"),
+        port=int(os.getenv("REDIS_PORT", 6379)),
+        db=0,
+        socket_connect_timeout=0.5,
+        socket_timeout=0.5,
+        decode_responses=True,
+    )
+    # Quick non-blocking check
+    _redis_client.ping()
+    REDIS_AVAILABLE = True
+    print("[OK] Redis connection established.")
+except Exception as e:
+    _redis_client = None
+    REDIS_AVAILABLE = False
+    print(f"[INFO] Redis not available ({e}) — using SQLite recommendation cache.")
+
+# ── Optional Celery Tasks ─────────────────────────────────────────────────────
+try:
+    from tasks import dispatch_refresh_trending, dispatch_update_providers
+    TASKS_AVAILABLE = True
+except ImportError:
+    TASKS_AVAILABLE = False
+    def dispatch_refresh_trending(): pass  # type: ignore
+    def dispatch_update_providers(ids): pass  # type: ignore
+
 from enhanced_database import (
     get_db, User, Media, StreamingPlatform, EnhancedInteraction,
     UserReview, RecommendationCache, TrendingMedia, SearchAnalytics,
@@ -47,7 +91,7 @@ load_dotenv()
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "")
 
 app = FastAPI(
-    title="MIRAI AI — Movie & TV Recommendation Engine",
+    title="Movie and TV Shows Recommending Engine AI — Movie & TV Recommendation Engine",
     description=(
         "Advanced AI-powered recommendation system with semantic search, "
         "hybrid filtering, multilingual support, real-time streaming data, "
@@ -56,14 +100,26 @@ app = FastAPI(
     version="2.0.0",
 )
 
+# CORS — use ALLOWED_ORIGINS env var for non-local deployments
+_raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:8501,http://127.0.0.1:8501,http://localhost:5173,http://127.0.0.1:5173")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["X-Total-Count"],
 )
+
+# Rate limiter state + handler
+if SLOWAPI_AVAILABLE and limiter:
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Mount auth router (provides /token endpoint)
+app.include_router(auth_router)
 
 # ── Global singletons ─────────────────────────────────────────────────────────
 embeddings = None
@@ -172,7 +228,14 @@ class WatchlistRequest(BaseModel):
 @app.on_event("startup")
 async def startup_event():
     init_enhanced_db()
-    print("[STARTING] MIRAI AI Enhanced Backend Started!")
+    print("[STARTING] Movie and TV Shows Recommending Engine Backend Started!")
+    # Try to refresh trending data in background (silent fail if Redis/Celery absent)
+    if TASKS_AVAILABLE:
+        try:
+            import threading
+            threading.Thread(target=dispatch_refresh_trending, daemon=True).start()
+        except Exception:
+            pass
 
 
 # ── Health & Stats ────────────────────────────────────────────────────────────
@@ -232,13 +295,35 @@ async def get_system_stats(db: Session = Depends(get_db)):
 async def get_enhanced_recommendations(
     request: UserQuery,
     background_tasks: BackgroundTasks,
+    http_request: Request,
     db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """Get hybrid AI-powered recommendations with multilingual support."""
     try:
+        # Apply rate limit (10 requests/minute per IP) when slowapi is available
+        # DISABLED FOR PRESENTATION:
+        # if SLOWAPI_AVAILABLE and limiter:
+        #     try:
+        #         await limiter._check_request_limit(http_request, "10/minute", None, None)
+        #     except Exception:
+        #         raise HTTPException(
+        #             status_code=429,
+        #             detail="Rate limit exceeded: 10 recommendation requests per minute allowed."
+        #         )
+
         cache_key = _create_cache_key(request)
 
-        # Check recommendation cache
+        # 1. Check Redis cache (fast path)
+        if REDIS_AVAILABLE and _redis_client:
+            try:
+                cached_json = _redis_client.get(f"rec:{cache_key}")
+                if cached_json:
+                    return json.loads(cached_json)
+            except Exception:
+                pass
+
+        # 2. Check SQLite recommendation cache (slower fallback)
         cached = db.query(RecommendationCache).filter(
             RecommendationCache.cache_key == cache_key,
             RecommendationCache.expires_at > datetime.now(),
@@ -333,6 +418,8 @@ async def get_enhanced_recommendations(
                 "cast": media_record.cast or [],
                 "similarity_score": float(similarity_score),
                 "streaming_platforms": db_platforms,
+                # Review text for embedding enrichment
+                "reviews_text": media_record.reviews_text or "",
             }
             candidates.append(candidate)
 
@@ -472,7 +559,16 @@ async def get_enhanced_recommendations(
                 "ai_features": {"fallback": True},
             }
 
-        # Cache & analytics (background)
+        # Cache results in Redis (fast) and SQLite (persistent)
+        if REDIS_AVAILABLE and _redis_client:
+            try:
+                _redis_client.setex(
+                    f"rec:{cache_key}",
+                    3600,  # 1 hour TTL
+                    json.dumps(response_data, default=str)
+                )
+            except Exception:
+                pass
         background_tasks.add_task(_cache_results, cache_key, response_data)
         background_tasks.add_task(
             _log_analytics, request, len(response_data.get("movies", [])), detected_lang
@@ -480,6 +576,9 @@ async def get_enhanced_recommendations(
 
         return response_data
 
+    except (HTTPException, RateLimitExceeded):
+        # Re-raise explicit exceptions (like 429 Rate Limit) without converting to 500
+        raise
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -491,7 +590,9 @@ async def get_enhanced_recommendations(
 @app.post("/api/interact")
 @app.post("/api/rate")  # backward-compat alias
 async def record_interaction(
-    request: InteractionRequest, db: Session = Depends(get_db)
+    request: InteractionRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """Record user interaction (like/dislike/watch/rate/skip)."""
     try:
@@ -605,6 +706,213 @@ async def get_trending(db: Session = Depends(get_db)):
             "movies_count": 0, "shows_count": 0,
             "updated_at": datetime.now().isoformat(),
         }
+
+
+# ── Watchlist Endpoints ───────────────────────────────────────────────────────
+
+class WatchlistAddRequest(BaseModel):
+    user_id: str
+    tmdb_id: int
+    action: str = "add"  # "add" | "remove"
+
+
+@app.post("/api/watchlist")
+async def manage_watchlist(
+    request: WatchlistAddRequest,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Add or remove a title from the user's watchlist."""
+    try:
+        from enhanced_database import user_watchlist as watchlist_table
+        user = db.query(User).filter(User.user_id == request.user_id).first()
+        if not user:
+            user = User(user_id=request.user_id)
+            db.add(user)
+            db.commit()
+
+        media = db.query(Media).filter(Media.tmdb_id == request.tmdb_id).first()
+        if not media:
+            raise HTTPException(status_code=404, detail=f"Media tmdb_id={request.tmdb_id} not found.")
+
+        if request.action == "add":
+            if media not in user.watchlist:
+                user.watchlist.append(media)
+            db.commit()
+            return {"status": "success", "message": f"Added '{media.title}' to watchlist."}
+        elif request.action == "remove":
+            if media in user.watchlist:
+                user.watchlist.remove(media)
+            db.commit()
+            return {"status": "success", "message": f"Removed '{media.title}' from watchlist."}
+        else:
+            raise HTTPException(status_code=400, detail="action must be 'add' or 'remove'.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Watchlist error: {str(e)}")
+
+
+@app.get("/api/watchlist/{user_id}")
+async def get_watchlist(
+    user_id: str,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return all watchlisted titles for a user."""
+    try:
+        from enhanced_database import user_watchlist as wt, SessionLocal as SL
+        from sqlalchemy import select, text
+
+        user = db.query(User).filter(User.user_id == user_id).first()
+        if not user:
+            return {"watchlist": [], "count": 0}
+
+        items = []
+        for m in user.watchlist:
+            # Check watched status from association table
+            watched_row = db.execute(
+                text("SELECT watched FROM user_watchlist WHERE user_id=:uid AND media_id=:mid"),
+                {"uid": user_id, "mid": m.db_id}
+            ).fetchone()
+            watched = bool(watched_row[0]) if watched_row else False
+            items.append({
+                "id": m.tmdb_id,
+                "title": m.title,
+                "poster_path": _format_poster_url(m.poster_path),
+                "rating": float(m.rating or 0),
+                "media_type": m.media_type,
+                "release_date": m.release_date or "",
+                "genres": m.genres or [],
+                "watched": watched,
+            })
+        return {"watchlist": items, "count": len(items)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Watchlist fetch error: {str(e)}")
+
+
+@app.patch("/api/watchlist/{user_id}/{tmdb_id}/watched")
+async def mark_watched(
+    user_id: str,
+    tmdb_id: int,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Mark a watchlist item as watched."""
+    try:
+        from sqlalchemy import text
+        media = db.query(Media).filter(Media.tmdb_id == tmdb_id).first()
+        if not media:
+            raise HTTPException(status_code=404, detail=f"tmdb_id={tmdb_id} not found.")
+        db.execute(
+            text("UPDATE user_watchlist SET watched=1, watch_date=:now WHERE user_id=:uid AND media_id=:mid"),
+            {"uid": user_id, "mid": media.db_id, "now": datetime.utcnow()}
+        )
+        db.commit()
+        return {"status": "success", "message": f"Marked '{media.title}' as watched."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Mark-watched error: {str(e)}")
+
+
+# ── Admin Routes ──────────────────────────────────────────────────────────────
+
+class ManageSourceRequest(BaseModel):
+    source_type: str   # "csv" | "url"
+    source: str        # file path or URL
+    media_type: str = "movie"  # "movie" | "tv"
+
+
+@app.post("/api/admin/update_db")
+async def admin_update_db(
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    admin: dict = Depends(require_admin),
+):
+    """Admin: trigger a TMDB trending refresh (updates TrendingMedia table)."""
+    try:
+        if TASKS_AVAILABLE:
+            background_tasks.add_task(dispatch_refresh_trending)
+            return {"status": "queued", "message": "Trending refresh dispatched (Celery or background thread)."}
+        else:
+            # Inline synchronous refresh
+            from tasks import _do_refresh_trending
+            background_tasks.add_task(_do_refresh_trending)
+            return {"status": "queued", "message": "Trending refresh dispatched as background task."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Admin update_db error: {str(e)}")
+
+
+@app.post("/api/admin/manage_sources")
+async def admin_manage_sources(
+    request: ManageSourceRequest,
+    background_tasks: BackgroundTasks,
+    admin: dict = Depends(require_admin),
+):
+    """
+    Admin: register a new CSV or URL data source for ingestion.
+    Queues a background ingest task.
+    """
+    import pathlib
+
+    if request.source_type == "csv":
+        p = pathlib.Path(request.source)
+        if not p.exists():
+            raise HTTPException(status_code=400, detail=f"CSV file not found: {request.source}")
+        if p.suffix.lower() != ".csv":
+            raise HTTPException(status_code=400, detail="source must be a .csv file.")
+        source_abs = str(p.resolve())
+    elif request.source_type == "url":
+        if not request.source.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="source must be a valid http/https URL.")
+        source_abs = request.source
+    else:
+        raise HTTPException(status_code=400, detail="source_type must be 'csv' or 'url'.")
+
+    def _run_ingest(source: str, source_type: str, media_type: str):
+        """Background ingest task."""
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.dirname(__file__))
+            if source_type == "csv":
+                import pandas as pd
+                from enhanced_database import get_db_session, Media
+                df = pd.read_csv(source, dtype=str).fillna("")
+                db2 = get_db_session()
+                added = 0
+                for _, row in df.iterrows():
+                    tmdb_id = row.get("id") or row.get("tmdb_id", "")
+                    if not tmdb_id:
+                        continue
+                    exists = db2.query(Media).filter(Media.tmdb_id == int(tmdb_id)).first()
+                    if exists:
+                        continue
+                    db2.add(Media(
+                        tmdb_id=int(tmdb_id),
+                        title=row.get("title", "Unknown"),
+                        overview=row.get("overview", ""),
+                        release_date=row.get("release_date", ""),
+                        rating=float(row.get("vote_average") or 0),
+                        poster_path=row.get("poster_path", ""),
+                        media_type=media_type,
+                    ))
+                    added += 1
+                db2.commit()
+                db2.close()
+                print(f"[admin/manage_sources] Ingested {added} new titles from {source}")
+            elif source_type == "url":
+                print(f"[admin/manage_sources] URL ingestion queued for: {source} (implement custom scraper)")
+        except Exception as e:
+            print(f"[admin/manage_sources] Ingest error: {e}")
+
+    background_tasks.add_task(_run_ingest, source_abs, request.source_type, request.media_type)
+    return {
+        "status": "queued",
+        "message": f"Ingest of '{source_abs}' (type={request.source_type}) dispatched.",
+        "source_type": request.source_type,
+        "media_type": request.media_type,
+    }
 
 
 # ── User Stats Endpoint ───────────────────────────────────────────────────────

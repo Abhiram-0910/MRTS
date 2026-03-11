@@ -1,4 +1,4 @@
-# 🤖 MIRAI AI - Revolutionary Movie Recommendation Engine v2.0.0
+# 🤖 Movie and TV Shows Recommending Engine AI - Revolutionary Movie Recommendation Engine v2.0.0
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110.0-green.svg)](https://fastapi.tiangolo.com)
@@ -7,7 +7,7 @@
 
 ## 🌟 Overview
 
-MIRAI AI is a revolutionary, AI-powered movie and TV show recommendation engine that transforms how you discover content. With advanced machine learning, multilingual support, and personalized AI explanations, MIRAI AI delivers an unparalleled entertainment discovery experience.
+Movie and TV Shows Recommending Engine AI is a revolutionary, AI-powered movie and TV show recommendation engine that transforms how you discover content. With advanced machine learning, multilingual support, and personalized AI explanations, Movie and TV Shows Recommending Engine AI delivers an unparalleled entertainment discovery experience.
 
 ## ✨ Key Features
 
@@ -76,7 +76,7 @@ python final_setup.py
 # - GEMINI_API_KEY: Get from Google AI Studio
 # - TMDB_API_KEY: Get from The Movie Database
 
-# Start MIRAI AI
+# Start Movie and TV Shows Recommending Engine AI
 start_mirai.bat  # Windows
 ./start_mirai.sh  # Linux/Mac
 ```
@@ -302,6 +302,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**Made with ❤️ by the MIRAI AI Team**
+**Made with ❤️ by the Movie and TV Shows Recommending Engine AI Team**
 
 🚀 Ready to revolutionize your movie discovery experience!

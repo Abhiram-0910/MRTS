@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Starting MIRAI AI..."
+echo "Starting Movie and TV Shows Recommending Engine AI..."
 
 # Start backend
 echo "Starting backend server..."

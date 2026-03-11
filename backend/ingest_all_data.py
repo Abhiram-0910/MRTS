@@ -1,5 +1,5 @@
 """
-ingest_all_data.py — MIRAI Production Data Ingest Pipeline
+ingest_all_data.py — Movie and TV Shows Recommending Engine Production Data Ingest Pipeline
 Fetches 10,000+ movies and TV shows from TMDB, stores in SQLite, builds FAISS index.
 Run once (or to refresh): python ingest_all_data.py
 Resume-safe: skips already-ingested tmdb_ids.
@@ -302,7 +302,7 @@ def upsert_media_and_platforms(session, item: dict) -> Optional[int]:
 
 def main():
     print("=" * 60)
-    print("MIRAI Data Ingest Pipeline")
+    print("Movie and TV Shows Recommending Engine Data Ingest Pipeline")
     print(f"Target: {TARGET_SIZE:,}+ titles")
     print("=" * 60)
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MIRAI AI Final Setup and Startup Script
+Movie and TV Shows Recommending Engine AI Final Setup and Startup Script
 Complete setup for the revolutionary movie recommendation system
 """
 
@@ -11,9 +11,9 @@ import time
 from pathlib import Path
 
 def print_banner():
-    """Print MIRAI AI banner"""
+    """Print Movie and TV Shows Recommending Engine AI banner"""
     banner = """
-🤖 MIRAI AI - Revolutionary Movie Recommendation Engine v2.0.0 🤖
+🤖 Movie and TV Shows Recommending Engine AI - Revolutionary Movie Recommendation Engine v2.0.0 🤖
 
 Advanced AI-powered movie and TV show discovery platform with:
 ✨ AI-powered explanations with Google Gemini
@@ -60,7 +60,7 @@ def run_command(cmd, description="", cwd=None, timeout=300):
 
 def setup_environment():
     """Setup the environment"""
-    print("🛠️  Setting up MIRAI AI environment...")
+    print("🛠️  Setting up Movie and TV Shows Recommending Engine AI environment...")
     
     # Create data directories
     print("📁 Creating data directories...")
@@ -74,7 +74,7 @@ def setup_environment():
     env_file = Path(".env")
     if not env_file.exists():
         print("⚙️  Creating .env file...")
-        env_content = """# MIRAI AI Configuration
+        env_content = """# Movie and TV Shows Recommending Engine AI Configuration
 GEMINI_API_KEY=your_gemini_api_key_here
 TMDB_API_KEY=your_tmdb_api_key_here
 DATABASE_URL=sqlite:///./mirai.db
@@ -132,7 +132,7 @@ def create_startup_scripts():
     # Windows batch file
     with open("start_mirai.bat", "w") as f:
         f.write("""@echo off
-echo Starting MIRAI AI...
+echo Starting Movie and TV Shows Recommending Engine AI...
 
 REM Start backend
 echo Starting backend server...
@@ -149,7 +149,7 @@ streamlit run enhanced_app.py
     with open("start_mirai.sh", "w") as f:
         f.write("""#!/bin/bash
 
-echo "Starting MIRAI AI..."
+echo "Starting Movie and TV Shows Recommending Engine AI..."
 
 # Start backend
 echo "Starting backend server..."
@@ -202,7 +202,7 @@ def main():
         
         # Final summary
         print("\n" + "=" * 60)
-        print(f"🎉 MIRAI AI Setup Complete! ({success_count}/{total_steps} steps)")
+        print(f"🎉 Movie and TV Shows Recommending Engine AI Setup Complete! ({success_count}/{total_steps} steps)")
         print("=" * 60)
         
         print("\n📋 Next Steps:")
@@ -210,7 +210,7 @@ def main():
         print("   - GEMINI_API_KEY: Get from Google AI Studio")
         print("   - TMDB_API_KEY: Get from The Movie Database")
         print()
-        print("🚀 To start MIRAI AI:")
+        print("🚀 To start Movie and TV Shows Recommending Engine AI:")
         if os.name == 'nt':
             print("   Run: start_mirai.bat")
         else:
@@ -234,7 +234,7 @@ def main():
         print()
         print("❓ Need help? Check the README.md file")
         print()
-        print("🌟 Enjoy MIRAI AI - Your revolutionary movie discovery engine!")
+        print("🌟 Enjoy Movie and TV Shows Recommending Engine AI - Your revolutionary movie discovery engine!")
         
         return True
         

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MIRAI AI Enhanced Setup Script
+Movie and TV Shows Recommending Engine AI Enhanced Setup Script
 Comprehensive setup for the revolutionary movie recommendation system
 """
 
@@ -26,8 +26,8 @@ class Colors:
     UNDERLINE = '\033[4m'
     RESET = '\033[0m'
 
-class MIRAISetup:
-    """Main setup class for MIRAI AI"""
+class Movie and TV Shows Recommending EngineSetup:
+    """Main setup class for Movie and TV Shows Recommending Engine AI"""
     
     def __init__(self):
         self.project_root = Path(__file__).parent
@@ -40,7 +40,7 @@ class MIRAISetup:
         
         # Setup configuration
         self.config = {
-            "project_name": "MIRAI AI",
+            "project_name": "Movie and TV Shows Recommending Engine AI",
             "version": "2.0.0",
             "description": "Revolutionary AI-Powered Movie & TV Recommendation Engine",
             "features": [
@@ -58,12 +58,12 @@ class MIRAISetup:
         }
     
     def print_banner(self):
-        """Print MIRAI AI banner"""
+        """Print Movie and TV Shows Recommending Engine AI banner"""
         banner = f"""
 {Colors.CYAN}{Colors.BOLD}
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                                                                              ║
-║    🤖 MIRAI AI - Revolutionary Movie Recommendation Engine v2.0.0 🤖         ║
+║    🤖 Movie and TV Shows Recommending Engine AI - Revolutionary Movie Recommendation Engine v2.0.0 🤖         ║
 ║                                                                              ║
 ║    {Colors.WHITE}Advanced AI-powered movie and TV show discovery platform{Colors.CYAN}              ║
 ║    {Colors.WHITE}with multilingual support, real-time data, and personalized{Colors.CYAN}         ║
@@ -249,7 +249,7 @@ class MIRAISetup:
         """Create environment configuration file"""
         self.print_step("Creating Environment Configuration", "Setting up .env file")
         
-        env_content = f"""# MIRAI AI Environment Configuration
+        env_content = f"""# Movie and TV Shows Recommending Engine AI Environment Configuration
 # Generated on {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 # API Keys (Add your keys here)
@@ -320,7 +320,7 @@ CELERY_BACKEND=redis://localhost:6379/2
         if self.os_type == "Windows":
             setup_bat = self.project_root / "setup.bat"
             bat_content = f"""@echo off
-echo {Colors.CYAN}Setting up MIRAI AI...{Colors.RESET}
+echo {Colors.CYAN}Setting up Movie and TV Shows Recommending Engine AI...{Colors.RESET}
 
 REM Create virtual environment
 echo Creating virtual environment...
@@ -364,7 +364,7 @@ pause
         setup_sh = self.project_root / "setup.sh"
         sh_content = f"""#!/bin/bash
 
-{Colors.CYAN}Setting up MIRAI AI...{Colors.RESET}
+{Colors.CYAN}Setting up Movie and TV Shows Recommending Engine AI...{Colors.RESET}
 
 # Colors for output
 GREEN='\\033[0;32m'
@@ -422,7 +422,7 @@ echo
         if self.os_type == "Windows":
             run_bat = self.project_root / "run.bat"
             bat_content = f"""@echo off
-echo {Colors.CYAN}Starting MIRAI AI...{Colors.RESET}
+echo {Colors.CYAN}Starting Movie and TV Shows Recommending Engine AI...{Colors.RESET}
 
 REM Activate virtual environment
 call venv\\Scripts\\activate.bat
@@ -452,7 +452,7 @@ pause
         run_sh = self.project_root / "run.sh"
         sh_content = f"""#!/bin/bash
 
-{Colors.CYAN}Starting MIRAI AI...{Colors.RESET}
+{Colors.CYAN}Starting Movie and TV Shows Recommending Engine AI...{Colors.RESET}
 
 # Activate virtual environment
 source venv/bin/activate
@@ -493,7 +493,7 @@ trap "kill $BACKEND_PID" EXIT
         """Create enhanced documentation"""
         self.print_step("Creating Documentation", "Generating comprehensive documentation")
         
-        readme_content = f"""# 🤖 MIRAI AI - Revolutionary Movie Recommendation Engine
+        readme_content = f"""# 🤖 Movie and TV Shows Recommending Engine AI - Revolutionary Movie Recommendation Engine
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.110.0-green.svg)](https://fastapi.tiangolo.com)
@@ -502,7 +502,7 @@ trap "kill $BACKEND_PID" EXIT
 
 ## 🌟 Overview
 
-MIRAI AI is a revolutionary, AI-powered movie and TV show recommendation engine that transforms how you discover content. With advanced machine learning, multilingual support, and personalized AI explanations, MIRAI AI delivers an unparalleled entertainment discovery experience.
+Movie and TV Shows Recommending Engine AI is a revolutionary, AI-powered movie and TV show recommendation engine that transforms how you discover content. With advanced machine learning, multilingual support, and personalized AI explanations, Movie and TV Shows Recommending Engine AI delivers an unparalleled entertainment discovery experience.
 
 ## ✨ Key Features
 
@@ -596,7 +596,7 @@ chmod +x run.sh
 ./run.sh
 ```
 
-### 5. Access MIRAI AI
+### 5. Access Movie and TV Shows Recommending Engine AI
 - Frontend: http://localhost:8501
 - Backend API: http://localhost:8000
 - API Docs: http://localhost:8000/docs
@@ -808,7 +808,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**Made with ❤️ by the MIRAI AI Team**
+**Made with ❤️ by the Movie and TV Shows Recommending Engine AI Team**
 
 {Colors.GREEN}🚀 Ready to revolutionize your movie discovery experience!{Colors.RESET}
 """
@@ -828,7 +828,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
         """Run the complete setup process"""
         self.print_banner()
         
-        print(f"{Colors.PURPLE}{Colors.BOLD}Starting MIRAI AI Enhanced Setup...{Colors.RESET}")
+        print(f"{Colors.PURPLE}{Colors.BOLD}Starting Movie and TV Shows Recommending Engine AI Enhanced Setup...{Colors.RESET}")
         print()
         
         # Setup steps
@@ -866,7 +866,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
         print()
         
         if success_count == total_steps:
-            print(f"{Colors.GREEN}{Colors.BOLD}🎉 MIRAI AI setup completed successfully!{Colors.RESET}")
+            print(f"{Colors.GREEN}{Colors.BOLD}🎉 Movie and TV Shows Recommending Engine AI setup completed successfully!{Colors.RESET}")
             print()
             print(f"{Colors.CYAN}Next steps:{Colors.RESET}")
             print(f"1. {Colors.YELLOW}Add your API keys to the .env file{Colors.RESET}")
@@ -883,7 +883,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 def main():
     """Main function"""
-    setup = MIRAISetup()
+    setup = Movie and TV Shows Recommending EngineSetup()
     
     try:
         success = setup.run_full_setup()

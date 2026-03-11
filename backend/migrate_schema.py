@@ -1,5 +1,5 @@
 """
-migrate_schema.py — Safe schema migration for MIRAI.
+migrate_schema.py — Safe schema migration for Movie and TV Shows Recommending Engine.
 Adds any missing columns to the existing media table without dropping data.
 Run once: python migrate_schema.py
 """

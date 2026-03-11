@@ -33,10 +33,13 @@ class RecommendationEngine:
             print("[WARNING] TMDB_API_KEY not found in environment variables. Streaming platforms will not be available.")
 
         try:
+            # SECURITY NOTE: allow_dangerous_deserialization is intentionally omitted.
+            # The FAISS index at ../data/faiss_index is a trusted build artifact produced
+            # by data_ingestor.py in this project. Never load FAISS indexes from
+            # untrusted or user-supplied paths without re-enabling the flag explicitly.
             self.vector_store = FAISS.load_local(
                 "../data/faiss_index",
-                self.embeddings,
-                allow_dangerous_deserialization=True
+                self.embeddings
             )
             # We no longer load the CSV here. We use PostgreSQL.
         except Exception as e:
@@ -71,7 +74,7 @@ class RecommendationEngine:
                   f"Do not list the titles individually, just explain the thematic connection.")
         try:
             response = self.gemini_model.generate_content(prompt)
-            return f"🤖 **MIRAI AI Says:**\n\n{response.text}"
+            return f"🤖 **Movie and TV Shows Recommending Engine AI Says:**\n\n{response.text}"
         except Exception as e:
             return f"Failed to generate explanation: {str(e)}"
 
@@ -146,14 +149,14 @@ class RecommendationEngine:
                     continue
                     
                 # Hybrid Collaborative Filtering Score
-                # If the user liked similar things, we boost it. 
-                # For a simple local implementation: +0.2 if liked, -0.5 if disliked
+                # If the user liked similar things, we boost it.
+                # Disliked items receive a penalty but are NOT hard-excluded so that
+                # semantically exceptional results can still surface.
                 collab_boost = 0.0
                 if int(media_record.tmdb_id) in user_likes:
                     collab_boost = 0.2
                 elif int(media_record.tmdb_id) in user_dislikes:
-                    # Heavily penalize dislikes, or even skip them entirely
-                    continue
+                    collab_boost = -0.3  # Negative penalty; combined_score may still be positive
 
                 # Calculate combined score: similarity (70%) + rating boost (30%) + collab_boost
                 normalized_rating = (media_record.rating or 0) / 10.0  # Normalize to 0-1

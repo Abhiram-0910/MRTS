@@ -6,7 +6,7 @@ REM Change to the directory where this script lives
 cd /d "%~dp0"
 
 echo ============================================================
-echo  MIRAI AI - Movie ^& TV Recommendation Engine
+echo  Movie and TV Shows Recommending Engine AI - Movie ^& TV Recommendation Engine
 echo ============================================================
 
 REM Check if venv exists
@@ -32,14 +32,14 @@ if not exist "data\faiss_index\index.faiss" (
 )
 
 REM Start backend in a new window
-echo [1/2] Starting MIRAI backend on http://localhost:8000 ...
-start "MIRAI Backend" cmd /k "cd /d "%~dp0backend" && uvicorn enhanced_main:app --host 0.0.0.0 --port 8000 --reload"
+echo [1/2] Starting Movie and TV Shows Recommending Engine backend on http://localhost:8000 ...
+start "Movie and TV Shows Recommending Engine Backend" cmd /k "cd /d "%~dp0backend" && uvicorn enhanced_main:app --host 0.0.0.0 --port 8000 --reload"
 
 REM Wait for backend to initialize
 echo [INFO] Waiting for backend to start...
 timeout /t 6 /nobreak >nul
 
 REM Start frontend
-echo [2/2] Starting MIRAI frontend on http://localhost:8501 ...
+echo [2/2] Starting Movie and TV Shows Recommending Engine frontend on http://localhost:8501 ...
 cd frontend
 streamlit run enhanced_app.py --server.port 8501 --server.headless false

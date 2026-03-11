@@ -2,6 +2,11 @@ import requests, json
 
 base = "http://localhost:8000"
 
+# Authenticate first
+auth_res = requests.post(f"{base}/token", data={"username": "admin", "password": "mirai2024"})
+token = auth_res.json().get("access_token", "")
+headers = {"Authorization": f"Bearer {token}"}
+
 tests = [
     {"label": "English query",  "query": "mind-bending sci-fi thriller"},
     {"label": "Hindi query",    "query": "koi acchi hindi comedy film"},
@@ -12,6 +17,7 @@ for t in tests:
     print(f"\n=== {t['label']}: '{t['query']}' ===")
     r = requests.post(f"{base}/api/recommend",
         json={"query": t["query"], "user_id": "test_user"},
+        headers=headers,
         timeout=30)
     if r.status_code == 200:
         data = r.json()

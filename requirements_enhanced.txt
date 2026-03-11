@@ -1,4 +1,4 @@
-# Enhanced requirements for MIRAI AI 2.0
+# Enhanced requirements for Movie and TV Shows Recommending Engine AI 2.0
 fastapi==0.110.0
 uvicorn==0.27.1
 sqlalchemy==2.0.25

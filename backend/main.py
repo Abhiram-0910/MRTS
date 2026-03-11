@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -9,11 +10,18 @@ from schemas import UserQuery, InteractionRequest
 
 load_dotenv()
 
-app = FastAPI(title="MIRAI Movie & TV Recommendation API")
+app = FastAPI(title="Movie and TV Shows Recommending Engine Movie & TV Recommendation API")
+
+# Read allowed origins from env; default to local Streamlit ports for development.
+_raw_origins = os.getenv(
+    "ALLOWED_ORIGINS",
+    "http://localhost:8501,http://127.0.0.1:8501"
+)
+ALLOWED_ORIGINS = [origin.strip() for origin in _raw_origins.split(",") if origin.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
