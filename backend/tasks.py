@@ -1,5 +1,5 @@
 """
-tasks.py — Optional Celery background tasks for Movie and TV Shows Recommending Engine.
+tasks.py — Optional Celery background tasks for Movie & TV Recommendation Engine.
 
 Uses Redis as broker/backend. The app works WITHOUT Redis — all Celery
 calls are wrapped in try/except so failures are silent and FastAPI's
@@ -9,9 +9,11 @@ Setup (optional):
   # Windows — use Redis via Docker:
   docker run -d -p 6379:6379 redis:alpine
 
-  # Then run the Celery worker:
-  cd backend
-  ..\\venv\\Scripts\\celery -A tasks worker --loglevel=info --pool=solo
+  # Run the Celery worker from the REPO ROOT (not from inside backend/):
+  .\\venv\\Scripts\\celery -A backend.tasks worker --loglevel=info --pool=solo
+
+  # Or from the backend/ dir, specifying the module directly:
+  celery -A tasks worker --loglevel=info --pool=solo
 
 Environment variable:  CELERY_BROKER_URL  (default: redis://localhost:6379/0)
 """
@@ -225,23 +227,32 @@ def _do_ingest_data():
     """
     Core ingestion logic — rebuilds the FAISS vector index from CSV data.
     Shared by the Celery task and the inline BackgroundTasks fallback.
-    """
-    try:
-        import sys
-        import os
-        # Ensure the backend directory is on sys.path when run as a task
-        backend_dir = os.path.dirname(os.path.abspath(__file__))
-        if backend_dir not in sys.path:
-            sys.path.insert(0, backend_dir)
 
-        from data_ingestor import DataIngestor
-        print(f"[tasks] Starting FAISS data ingestion at {datetime.utcnow().isoformat()}")
-        ingestor = DataIngestor()
-        ingestor.create_faiss_index()
-        print(f"[tasks] Data ingestion complete at {datetime.utcnow().isoformat()}")
-    except Exception as e:
-        print(f"[tasks] Data ingestion error: {e}")
-        raise
+    Import strategy
+    ---------------
+    ``data_ingestor`` lives in the same directory as this file (``backend/``).
+    Rather than mutating ``sys.path`` at runtime (which is fragile and can
+    cause import-shadowing bugs when the worker CWD differs from the module
+    root), we load the module by its *absolute file path* using ``importlib``.
+    This is CWD-agnostic and does not change the global module search path.
+    """
+    import importlib.util
+
+    ingestor_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_ingestor.py")
+
+    spec = importlib.util.spec_from_file_location("data_ingestor", ingestor_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot locate data_ingestor module at: {ingestor_path}")
+
+    data_ingestor_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(data_ingestor_mod)   # type: ignore[union-attr]
+    DataIngestor = data_ingestor_mod.DataIngestor
+
+    print(f"[tasks] Starting FAISS data ingestion at {datetime.utcnow().isoformat()}")
+    ingestor = DataIngestor()
+    ingestor.create_faiss_index()
+    print(f"[tasks] Data ingestion complete at {datetime.utcnow().isoformat()}")
+
 
 
 if CELERY_AVAILABLE and celery_app is not None:

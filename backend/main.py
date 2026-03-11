@@ -18,6 +18,7 @@ because of a missing cache layer.
 import hashlib
 import json
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import redis
@@ -37,11 +38,19 @@ from auth import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 from datetime import timedelta
-from database import get_db, Interaction
+from database import get_db, Interaction, init_db
 from rag_engine import RecommendationEngine
 from schemas import UserQuery, InteractionRequest
 
 load_dotenv()
+
+# ── Startup / shutdown lifespan ───────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Create DB tables and seed admin user before accepting requests."""
+    init_db()
+    yield
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -49,6 +58,7 @@ app = FastAPI(
     title="Movie & TV Recommendation Engine API",
     description="Hybrid FAISS + collaborative-filtering recommendation API with JWT auth and Redis caching.",
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 _raw_origins = os.getenv(
