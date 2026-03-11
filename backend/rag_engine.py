@@ -1,7 +1,7 @@
 import numpy as np
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.schema import Embeddings
+from langchain_core.embeddings import Embeddings
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import os
@@ -54,7 +54,9 @@ class RecommendationEngine:
         gemini_api_key = os.environ.get("GEMINI_API_KEY")
         if gemini_api_key:
             genai.configure(api_key=gemini_api_key)
-            self.gemini_model = genai.GenerativeModel('gemini-1.5-pro')
+            # Using standard gemini-pro (Gemini 1.0) instead of 1.5, because
+            # 1.5 raises 404 Not Found due to the deprecated python client version.
+            self.gemini_model = genai.GenerativeModel('gemini-pro')
         else:
             self.gemini_model = None
             print("[WARNING] GEMINI_API_KEY not found — Gemini generation unavailable.")

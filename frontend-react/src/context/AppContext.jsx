@@ -1,49 +1,27 @@
-import React, { createContext, useState, useContext, useEffect } from 'react';
-import axios from 'axios';
-import toast from 'react-hot-toast';
+/**
+ * AppContext — lightweight context for non-auth app-wide state.
+ *
+ * Auth (login/logout/token) is handled exclusively by AuthContext.
+ * This context only holds userId (derived from the logged-in user)
+ * and language preference.
+ */
+import React, { createContext, useContext } from 'react';
+import { useAuth } from './AuthContext';
 
 const AppContext = createContext();
 
 export const AppProvider = ({ children }) => {
-    const [userId, setUserId] = useState('demo_user');
-    const [language, setLanguage] = useState('en');
-    const [token, setToken] = useState(null);
+  const { user } = useAuth();
 
-    // Automatically fetch a generic auth token so the user can use the app seamlessly
-    useEffect(() => {
-        const fetchToken = async () => {
-            try {
-                const formData = new URLSearchParams();
-                formData.append('username', 'admin');
-                formData.append('password', 'mirai2024');
+  // userId comes from the authenticated user; falls back to 'guest'
+  const userId = user?.username ?? 'guest';
+  const language = 'en';
 
-                const API_BASE = import.meta.env.VITE_BACKEND_URL || 'http://127.0.0.1:8000';
-                const res = await axios.post(`${API_BASE}/token`, formData, {
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded'
-                    }
-                });
-
-                const accessToken = res.data.access_token;
-                setToken(accessToken);
-
-                // Globally attach token to axios so ALL requests are authenticated automatically
-                axios.defaults.headers.common['Authorization'] = `Bearer ${accessToken}`;
-
-            } catch (err) {
-                console.error("Failed to authenticate with backend:", err);
-                toast.error("Failed to connect securely to the backend.");
-            }
-        };
-
-        fetchToken();
-    }, []);
-
-    return (
-        <AppContext.Provider value={{ userId, setUserId, language, setLanguage, token }}>
-            {children}
-        </AppContext.Provider>
-    );
+  return (
+    <AppContext.Provider value={{ userId, language }}>
+      {children}
+    </AppContext.Provider>
+  );
 };
 
 export const useAppContext = () => useContext(AppContext);

@@ -35,9 +35,9 @@ from auth import (
     router as auth_router,
 )
 from datetime import timedelta
-from database import get_db, Interaction, init_db
+from database import get_db, Interaction, Media, init_db
 from rag_engine import RecommendationEngine
-from schemas import UserQuery, InteractionRequest
+from schemas import UserQuery, InteractionRequest, WatchlistAction
 
 load_dotenv()
 
@@ -185,6 +185,15 @@ async def rate_recommendation(
     """
     user_id = current_user["username"]  # authoritative identity from token
 
+    # Handle 'remove' — delete any existing interaction for this title
+    if request.interaction_type == "remove":
+        db.query(Interaction).filter(
+            Interaction.user_id == user_id,
+            Interaction.tmdb_id == request.tmdb_id,
+        ).delete()
+        db.commit()
+        return {"status": "success", "message": f"Removed interaction for {request.tmdb_id}"}
+
     existing = db.query(Interaction).filter(
         Interaction.user_id == user_id,
         Interaction.tmdb_id == request.tmdb_id,
@@ -204,6 +213,81 @@ async def rate_recommendation(
         "status": "success",
         "message": f"Recorded '{request.interaction_type}' for title {request.tmdb_id}",
         "user_id": user_id,
+    }
+
+
+# ── Watchlist Endpoints ────────────────────────────────────────────────────────
+
+@app.get("/api/watchlist", tags=["watchlist"])
+async def get_watchlist(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the authenticated user's watchlist (all 'watchlist' interactions)."""
+    user_id = current_user["username"]
+    interactions = (
+        db.query(Interaction)
+        .filter(Interaction.user_id == user_id, Interaction.interaction_type == "watchlist")
+        .all()
+    )
+    items = []
+    for i in interactions:
+        media = db.query(Media).filter(Media.tmdb_id == i.tmdb_id).first()
+        if media:
+            items.append({
+                "id": media.tmdb_id,
+                "title": media.title,
+                "poster_path": media.poster_path,
+                "rating": media.rating,
+                "media_type": media.media_type,
+                "release_date": media.release_date,
+            })
+    return {"watchlist": items, "count": len(items)}
+
+
+@app.post("/api/watchlist", tags=["watchlist"])
+async def modify_watchlist(
+    request: WatchlistAction,
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Add or remove a title from the authenticated user's watchlist."""
+    user_id = current_user["username"]
+    existing = db.query(Interaction).filter(
+        Interaction.user_id == user_id,
+        Interaction.tmdb_id == request.tmdb_id,
+        Interaction.interaction_type == "watchlist",
+    ).first()
+
+    if request.action == "remove":
+        if existing:
+            db.delete(existing)
+            db.commit()
+        return {"status": "removed", "tmdb_id": request.tmdb_id}
+    else:  # add
+        if not existing:
+            db.add(Interaction(user_id=user_id, tmdb_id=request.tmdb_id, interaction_type="watchlist"))
+            db.commit()
+        return {"status": "added", "tmdb_id": request.tmdb_id}
+
+
+@app.get("/api/user_stats", tags=["watchlist"])
+async def get_user_stats(
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return interaction counts for the authenticated user."""
+    user_id = current_user["username"]
+    interactions = db.query(Interaction).filter(Interaction.user_id == user_id).all()
+    liked    = [i for i in interactions if i.interaction_type == "like"]
+    disliked = [i for i in interactions if i.interaction_type == "dislike"]
+    watchlist = [i for i in interactions if i.interaction_type == "watchlist"]
+    return {
+        "user_id": user_id,
+        "movies_liked": len(liked),
+        "movies_disliked": len(disliked),
+        "watchlist_size": len(watchlist),
+        "total_interactions": len(interactions),
     }
 
 

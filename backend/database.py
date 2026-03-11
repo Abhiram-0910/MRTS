@@ -6,23 +6,27 @@ from dotenv import load_dotenv
 from datetime import datetime
 from typing import Optional, List
 
+load_dotenv()
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./mirai.db")
+
 # pgvector integration: install with `pip install pgvector`
 try:
     from pgvector.sqlalchemy import Vector
-    PGVECTOR_AVAILABLE = True
+    # Only enable pgvector if we are actually connected to PostgreSQL
+    if "postgres" in DATABASE_URL.lower():
+        PGVECTOR_AVAILABLE = True
+    else:
+        PGVECTOR_AVAILABLE = False
+        print("[database] Connected to SQLite — pgvector storage disabled, falling back to FAISS.")
 except ImportError:
     Vector = None
     PGVECTOR_AVAILABLE = False
     print("[database] pgvector package not installed — vector storage unavailable. Run: pip install pgvector")
 
-load_dotenv()
-
 # We try to connect to PostgreSQL as requested. 
 # If credentials fail, the user can easily switch to SQLite locally by modifying DATABASE_URL.
 # Defaulting to an SQLite fallback so the project runs immediately without requiring a running Postgres server.
 try:
-    DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./mirai.db")
-    
     # SQLite requires check_same_thread=False for FastAPI concurrency
     if DATABASE_URL.startswith("sqlite"):
         engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -31,6 +35,8 @@ try:
 except Exception as e:
     DATABASE_URL = "sqlite:///./mirai.db"
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+    PGVECTOR_AVAILABLE = False
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
