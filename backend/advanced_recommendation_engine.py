@@ -278,10 +278,17 @@ class AdvancedRecommendationEngine:
         """Calculate cosine similarity between query embedding and each item embedding."""
         scores = []
         for item in items:
-            item_embedding = self._get_item_embedding(item)
+            chunk_embeddings = self._get_item_embedding(item)
             try:
+                # Max-pool across chunks: take the element-wise max to create a
+                # single representative vector that surfaces the most salient dims.
+                if len(chunk_embeddings) == 1:
+                    item_vec = chunk_embeddings[0]
+                else:
+                    item_vec = np.max(np.stack(chunk_embeddings, axis=0), axis=0)
+
                 similarity = cosine_similarity(
-                    [query_embedding], [item_embedding]
+                    [query_embedding], [item_vec]
                 )[0][0]
             except Exception:
                 similarity = 0.5

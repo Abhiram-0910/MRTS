@@ -123,6 +123,21 @@ def _cache_key(request: UserQuery) -> str:
 # No shadow routes needed here — auth_router is already included above.
 
 
+# ── Health Check Endpoint ─────────────────────────────────────────────────────
+
+@app.get("/api/health", tags=["system"])
+async def health_check():
+    """Returns service health status and backend component availability."""
+    r = _get_redis()
+    return {
+        "status": "ok",
+        "version": "2.0.0",
+        "vector_backend": "faiss" if not os.getenv("USE_PGVECTOR") else "pgvector",
+        "redis": "connected" if r else "unavailable",
+        "embedding_model": "paraphrase-multilingual-MiniLM-L12-v2",
+    }
+
+
 # ── Recommendation Endpoint (cached, public) ──────────────────────────────────
 
 @app.post("/api/recommend", tags=["recommendations"])
