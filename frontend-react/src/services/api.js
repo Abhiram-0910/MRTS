@@ -9,7 +9,10 @@
 
 import axios from 'axios';
 
-const BASE = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
+// Now that Vite proxies /api/* and /token to http://localhost:8000,
+// we use relative URLs. The browser sees all requests as same-origin
+// (http://localhost:5173) — CORS never applies.
+const BASE = '';
 
 // ── Axios instance ─────────────────────────────────────────────────────────────
 const api = axios.create({ baseURL: BASE });
