@@ -1,7 +1,8 @@
 import hashlib
 import logging
+import os
+import pickle
 import warnings
-from functools import lru_cache
 
 import numpy as np
 import scipy.sparse as sp
@@ -564,154 +565,89 @@ class AdvancedRecommendationEngine:
                 total_sim += similarity
         return score / total_sim if total_sim > 0 else 0.5
 
-    # ── ALS Matrix Factorization helpers ───────────────────────────────────────────
+    # ── ALS Matrix Factorization – Redis-backed ────────────────────────────────
+    #
+    # Training is done OFFLINE by the Celery task `train_als_model_task` which
+    # runs every 5 minutes.  The trained factors are serialised with pickle and
+    # stored under the key ALS_REDIS_KEY.  The scoring methods below simply
+    # deserialise and query those pre-computed arrays — O(1) per request.
+    #
+    # This eliminates:
+    #   • Synchronous training on the hot request path
+    #   • N redundant models in N Uvicorn worker processes
 
-    @staticmethod
-    def _matrix_to_csr(
-        user_item_dict: Dict[str, Dict],
-    ) -> Tuple["sp.csr_matrix", Dict[str, int], Dict[int, str], Dict[str, int], Dict[int, str]]:
+    ALS_REDIS_KEY = "als_model:v1"
+
+    @classmethod
+    def _load_als_from_redis(cls):
         """
-        Convert the nested dict ``{user_id: {item_id: rating}}`` produced by
-        ``_build_user_item_matrix`` into a SciPy CSR sparse matrix and the
-        bidirectional index mappings required by the ALS model.
+        Deserialise the ALS model payload from Redis.
 
         Returns
         -------
-        csr         : items × users CSR matrix  (implicit expects item-major)
-        user2idx    : str user_id  → int column index
-        idx2user    : int column index  → str user_id
-        item2idx    : str item_id  → int row index
-        idx2item    : int row index  → str item_id
+        dict with keys:
+            user_factors : np.ndarray  (n_users, factors)
+            item_factors : np.ndarray  (n_items, factors)
+            user2idx     : Dict[str, int]
+            item2idx     : Dict[str, int]
+        or ``None`` if the key is absent (model not yet trained) or Redis is
+        offline.
+
+        Thread / process safety
+        -----------------------
+        The payload is fully immutable numpy arrays + plain dicts — safe to
+        read concurrently from multiple Uvicorn workers without locks.
         """
-        # Build contiguous integer indices for every user and item seen
-        user_ids = sorted(user_item_dict.keys())
-        item_ids = sorted(
-            {str(iid) for u_ratings in user_item_dict.values() for iid in u_ratings}
-        )
-
-        user2idx: Dict[str, int] = {u: i for i, u in enumerate(user_ids)}
-        idx2user: Dict[int, str] = {i: u for u, i in user2idx.items()}
-        item2idx: Dict[str, int] = {it: i for i, it in enumerate(item_ids)}
-        idx2item: Dict[int, str] = {i: it for it, i in item2idx.items()}
-
-        rows, cols, data = [], [], []
-        for user, ratings in user_item_dict.items():
-            u_idx = user2idx[user]
-            for item_id, rating in ratings.items():
-                i_idx = item2idx[str(item_id)]
-                rows.append(i_idx)     # item row
-                cols.append(u_idx)     # user column
-                data.append(float(rating))
-
-        n_items = len(item_ids)
-        n_users = len(user_ids)
-        csr = sp.csr_matrix((data, (rows, cols)), shape=(n_items, n_users), dtype=np.float32)
-        return csr, user2idx, idx2user, item2idx, idx2item
-
-    def _build_als_model(
-        self,
-        user_item_dict: Dict[str, Dict],
-        factors: int = 32,
-        iterations: int = 15,
-        regularization: float = 0.01,
-    ):
-        """
-        Train a lightweight ALS model on the interaction matrix derived from
-        *user_item_dict*.  The result is cached on the instance so that repeated
-        calls within the same request do not retrain unnecessarily.
-
-        The cache key is a frozenset fingerprint of ``(user_id, item_id, rating)``
-        triples, so the model is automatically rebuilt whenever the interaction
-        data changes.
-
-        Parameters
-        ----------
-        factors        : Number of latent dimensions (32 is fast and sufficient for
-                         small-to-medium corpora).
-        iterations     : ALS alternating steps (15 is enough for convergence at this scale).
-        regularization : L2 penalty to prevent overfitting on sparse data.
-
-        Returns
-        -------
-        (model, user2idx, idx2user, item2idx, idx2item)
-        or ``None`` if implicit is not installed or the matrix is too small.
-        """
-        if not _ALS_AVAILABLE:
-            return None
-
-        # Produce a stable fingerprint of the current interaction set
-        fingerprint = frozenset(
-            (u, str(iid), v)
-            for u, ratings in user_item_dict.items()
-            for iid, v in ratings.items()
-        )
-
-        # Serve the cached model if the interaction data hasn't changed
-        cached = getattr(self, "_als_cache", None)
-        if cached is not None and cached["key"] == fingerprint:
-            return cached["model"]
-
         try:
-            csr, user2idx, idx2user, item2idx, idx2item = self._matrix_to_csr(user_item_dict)
-
-            # ALS needs at least 2 users and 2 items
-            if csr.shape[0] < 2 or csr.shape[1] < 2:
+            import redis as _redis_lib
+            _redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+            rc = _redis_lib.from_url(_redis_url, socket_connect_timeout=2, socket_timeout=2)
+            raw = rc.get(cls.ALS_REDIS_KEY)
+            if raw is None:
                 return None
-
-            model = _ALS(
-                factors=min(factors, csr.shape[1] - 1),  # factors must be < n_users
-                iterations=iterations,
-                regularization=regularization,
-                use_gpu=False,
-                calculate_training_loss=False,
-            )
-            # implicit ≥0.7 expects a user × items matrix for fit()
-            model.fit(csr.T.tocsr(), show_progress=False)
-
-            result = {
-                "key": fingerprint,
-                "model": (model, user2idx, idx2user, item2idx, idx2item),
-            }
-            self._als_cache = result
-            logger.info(
-                "[MF] ALS model trained: %d users × %d items, %d factors.",
-                csr.shape[1], csr.shape[0], model.factors,
-            )
-            return result["model"]
-
+            payload = pickle.loads(raw)  # noqa: S301 – internal data, author-controlled
+            return payload
         except Exception as exc:
-            logger.warning("[MF] ALS training failed: %s", exc)
+            logger.warning("[MF] Could not load ALS factors from Redis: %s", exc)
             return None
+
 
     def _item_based_score(self, item: Dict, user_id: str, user_interactions: List[Dict]) -> float:
         """
-        Item-based collaborative score using ALS item latent factors.
+        Item-based collaborative score using **pre-computed** ALS item factors
+        fetched from Redis.
 
-        For each item the user has previously interacted with, compute the cosine
-        similarity between that item's ALS latent-factor vector and the candidate
-        item's latent-factor vector.  Return the weighted average, where the weight
-        is the user's implicit rating for the interacted item.
+        The Celery task ``train_als_model_task`` trains the ALS model every
+        5 minutes and serialises the factors to Redis.  This method reads
+        those arrays without ever touching the training code — O(1) network
+        round-trip, zero CPU training cost on the hot path.
 
-        Falls back to 0.5 (neutral) on cold-start or when implicit is unavailable.
+        Scoring
+        -------
+        For each item the user has previously interacted with, compute the
+        cosine similarity between that item's latent-factor vector and the
+        candidate's vector.  Return the weighted average (weight = implicit
+        rating), normalised to [0, 1].
+
+        Falls back to 0.5 if:
+          • Redis is offline                 → model payload absent
+          • ALS model not yet trained        → key not in Redis
+          • Candidate item is a cold-start   → item not in index
         """
-        if not user_interactions or not _ALS_AVAILABLE:
+        payload = self._load_als_from_redis()
+        if payload is None:
             return 0.5
+
+        item_factors: np.ndarray = payload["item_factors"]   # (n_items, k)
+        item2idx: Dict[str, int] = payload["item2idx"]
+
+        candidate_id = str(item.get("id", ""))
+        if candidate_id not in item2idx:
+            return 0.5
+
+        candidate_vec = item_factors[item2idx[candidate_id]].reshape(1, -1)
 
         user_item_matrix = self._build_user_item_matrix(user_interactions)
-        als_result = self._build_als_model(user_item_matrix)
-        if als_result is None:
-            return 0.5
-
-        model, user2idx, idx2user, item2idx, idx2item = als_result
-        candidate_id = str(item.get("id", ""))
-
-        if candidate_id not in item2idx:
-            return 0.5  # cold-start: item not seen during training
-
-        candidate_idx = item2idx[candidate_id]
-        # item_factors: shape (n_items, factors)
-        candidate_vec = model.item_factors[candidate_idx].reshape(1, -1)
-
         user_rated = user_item_matrix.get(user_id, {})
         if not user_rated:
             return 0.5
@@ -721,9 +657,8 @@ class AdvancedRecommendationEngine:
             rid = str(rated_id)
             if rid == candidate_id or rid not in item2idx:
                 continue
-            rated_vec = model.item_factors[item2idx[rid]].reshape(1, -1)
+            rated_vec = item_factors[item2idx[rid]].reshape(1, -1)
             sim = float(cosine_similarity(candidate_vec, rated_vec)[0][0])
-            # Weight positive interactions more heavily than neutral or negative ones
             w = max(rating, 0.1)
             weighted_sim += sim * w
             total_weight += w
@@ -731,47 +666,42 @@ class AdvancedRecommendationEngine:
         if total_weight == 0:
             return 0.5
 
-        raw = weighted_sim / total_weight           # in roughly [-1, 1]
-        normalised = (raw + 1.0) / 2.0             # shift to [0, 1]
+        raw = weighted_sim / total_weight
+        normalised = (raw + 1.0) / 2.0
         return float(np.clip(normalised, 0.0, 1.0))
 
     def _matrix_factorization_score(self, item: Dict, user_id: str, user_interactions: List[Dict]) -> float:
         """
-        Matrix-factorization score via ALS latent-factor dot product.
+        Matrix-factorization score via **pre-computed** ALS latent-factor dot
+        product fetched from Redis.
 
-        Retrieves the user vector ``p_u`` and item vector ``q_i`` from the trained
-        ALS model and returns ``sigmoid(p_u ⋅ q_i)`` as a score in (0, 1).  The
-        sigmoid maps the raw dot product from an unbounded range into a smooth
-        probability-like output, which mixes cleanly with the other score components.
+        The Celery task ``train_als_model_task`` trains the ALS model every
+        5 minutes and serialises the factors to Redis.  This method reads
+        those arrays and computes ``sigmoid(p_u · q_i)`` in-process — no
+        model training, no implicit library call on the hot path.
 
-        Falls back to 0.5 (neutral) on cold-start or when implicit is unavailable.
+        Falls back to 0.5 if Redis is offline, model not yet trained, or
+        user/item is a cold-start.
         """
-        if not user_interactions or not _ALS_AVAILABLE:
+        payload = self._load_als_from_redis()
+        if payload is None:
             return 0.5
 
-        user_item_matrix = self._build_user_item_matrix(user_interactions)
-        als_result = self._build_als_model(user_item_matrix)
-        if als_result is None:
-            return 0.5
+        user_factors: np.ndarray = payload["user_factors"]   # (n_users, k)
+        item_factors: np.ndarray = payload["item_factors"]   # (n_items, k)
+        user2idx: Dict[str, int] = payload["user2idx"]
+        item2idx: Dict[str, int] = payload["item2idx"]
 
-        model, user2idx, idx2user, item2idx, idx2item = als_result
         candidate_id = str(item.get("id", ""))
-
         if candidate_id not in item2idx:
-            return 0.5  # cold-start
+            return 0.5
         if user_id not in user2idx:
-            return 0.5  # new user with no ALS vector yet
+            return 0.5
 
-        user_idx = user2idx[user_id]
-        item_idx = item2idx[candidate_id]
-
-        # user_factors: shape (n_users, factors)   item_factors: shape (n_items, factors)
-        p_u = model.user_factors[user_idx]   # latent preference vector
-        q_i = model.item_factors[item_idx]   # latent item attribute vector
-
+        p_u = user_factors[user2idx[user_id]]
+        q_i = item_factors[item2idx[candidate_id]]
         dot = float(np.dot(p_u, q_i))
 
-        # Sigmoid maps (-∞, +∞) → (0, 1) smoothly
         sigmoid = 1.0 / (1.0 + np.exp(-dot))
         return float(np.clip(sigmoid, 0.0, 1.0))
 

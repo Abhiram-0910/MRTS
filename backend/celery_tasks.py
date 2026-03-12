@@ -51,6 +51,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pickle
 from datetime import datetime, timezone
 from typing import Any
 
@@ -106,12 +107,19 @@ celery_app.conf.update(
         "update-trending-and-providers-daily": {
             "task": "celery_tasks.update_trending_and_providers",
             "schedule": crontab(hour=3, minute=0),          # 03:00 UTC every day
-            "options": {"expires": 3600},                   # Drop if not picked up within 1h
+            "options": {"expires": 3600},
         },
         "weekly-full-data-ingest": {
             "task": "celery_tasks.full_data_ingest",
             "schedule": crontab(hour=2, minute=0, day_of_week=0),  # Sundays 02:00 UTC
             "options": {"expires": 7200},
+        },
+        # ALS model retrained every 5 minutes so all Uvicorn workers share
+        # a single up-to-date model via Redis rather than training inline.
+        "train-als-model-every-5-minutes": {
+            "task": "celery_tasks.train_als_model_task",
+            "schedule": 300,          # every 300 seconds = 5 minutes
+            "options": {"expires": 240},  # drop if not picked up within 4 min
         },
     },
 )
@@ -408,6 +416,175 @@ def full_data_ingest(self) -> dict[str, Any]:
         "titles_collected": len(df),
     }
     logger.info("[full_data_ingest] DONE: %s", json.dumps(result))
+    return result
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Task 3 — Every 5 minutes: train ALS model and publish factors to Redis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_ALS_REDIS_KEY = "als_model:v1"    # must match AdvancedRecommendationEngine.ALS_REDIS_KEY
+_ALS_TTL       = 600               # 10 minutes — 2x the schedule interval, so a slow
+                                   # train never leaves workers with a stale/missing key
+
+@celery_app.task(
+    name="celery_tasks.train_als_model_task",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=60,
+    time_limit=240,       # 4-minute hard kill — training should be well under 1 min
+    soft_time_limit=180,
+    acks_late=True,
+)
+def train_als_model_task(self) -> dict[str, Any]:
+    """
+    Periodic task (every 5 minutes): train an ALS collaborative-filtering
+    model on ALL user interactions, then serialise the resulting latent-factor
+    arrays into Redis so every Uvicorn worker can read them without training.
+
+    Redis key : ``als_model:v1``  (matches AdvancedRecommendationEngine.ALS_REDIS_KEY)
+    TTL       : 600 s (10 minutes) — refreshed on every successful run
+
+    Payload schema (pickled dict)
+    -----------------------------
+    {
+        "user_factors" : np.ndarray  shape (n_users, k),
+        "item_factors" : np.ndarray  shape (n_items, k),
+        "user2idx"     : Dict[str, int],
+        "item2idx"     : Dict[str, int],
+        "trained_at"   : str  (ISO-8601 UTC),
+        "n_users"      : int,
+        "n_items"      : int,
+        "factors"      : int,
+    }
+
+    Design notes
+    ------------
+    * All heavy imports (implicit, scipy, database) stay inside the function body
+      so the module loads instantly and Celery Beat can import it without the
+      full ML stack initialised.
+    * If the interaction table has fewer than 2 users or 2 items the task exits
+      cleanly without writing to Redis — scoring methods will continue to return
+      0.5 (neutral) until enough data accumulates.
+    * ALS factors are stored as float32 numpy arrays; pickle is safe here
+      because the payload is produced and consumed by this same codebase.
+    """
+    import scipy.sparse as sp
+    import numpy as np
+    from collections import defaultdict
+
+    try:
+        from implicit.als import AlternatingLeastSquares
+    except ImportError:
+        logger.warning("[train_als_model_task] implicit not installed — skipping.")
+        return {"status": "skipped", "reason": "implicit not installed"}
+
+    rc = _get_redis()
+    if rc is None:
+        logger.warning("[train_als_model_task] Redis unavailable — cannot store model.")
+        return {"status": "skipped", "reason": "Redis unavailable"}
+
+    start = datetime.now(timezone.utc)
+
+    # ── Step 1: Fetch all interactions from the database ──────────────────────
+    from database import Interaction
+    db = _get_db()
+    _RATING_MAP = {"like": 4.0, "love": 5.0, "watch": 3.5,
+                   "dislike": 1.0, "skip": 2.0}
+    try:
+        interactions = db.query(Interaction).all()
+    finally:
+        db.close()
+
+    if not interactions:
+        logger.info("[train_als_model_task] No interactions found — skipping.")
+        return {"status": "skipped", "reason": "no interactions"}
+
+    # ── Step 2: Build user-item rating matrix ─────────────────────────────────
+    user_item: dict = defaultdict(dict)
+    for row in interactions:
+        uid  = str(getattr(row, "user_id",  None) or "")
+        iid  = str(getattr(row, "tmdb_id",  None) or getattr(row, "media_id", None) or "")
+        itype = getattr(row, "interaction_type", "watch") or "watch"
+        explicit = getattr(row, "rating", None)
+        if not uid or not iid:
+            continue
+        if itype == "rate" and explicit:
+            rating = float(explicit) / 2.0  # 1-10 scale → 0.5-5.0
+        else:
+            rating = _RATING_MAP.get(itype, 3.0)
+        # Keep the highest rating if a user interacted with the same item multiple times
+        if iid not in user_item[uid] or user_item[uid][iid] < rating:
+            user_item[uid][iid] = rating
+
+    user_ids = sorted(user_item.keys())
+    item_ids = sorted({iid for ratings in user_item.values() for iid in ratings})
+
+    n_users, n_items = len(user_ids), len(item_ids)
+    if n_users < 2 or n_items < 2:
+        logger.info(
+            "[train_als_model_task] Matrix too small (%d users, %d items) — skipping.",
+            n_users, n_items,
+        )
+        return {"status": "skipped", "reason": "matrix too small",
+                "n_users": n_users, "n_items": n_items}
+
+    user2idx = {u: i for i, u in enumerate(user_ids)}
+    item2idx = {it: i for i, it in enumerate(item_ids)}
+
+    # Build item-major CSR (rows=items, cols=users) — shape implicit expects
+    rows, cols, data = [], [], []
+    for uid, ratings in user_item.items():
+        u_idx = user2idx[uid]
+        for iid, rating in ratings.items():
+            rows.append(item2idx[iid])
+            cols.append(u_idx)
+            data.append(float(rating))
+
+    csr_item_user = sp.csr_matrix(
+        (data, (rows, cols)), shape=(n_items, n_users), dtype=np.float32
+    )
+
+    # ── Step 3: Train ALS ─────────────────────────────────────────────────────
+    _FACTORS   = min(32, n_users - 1, n_items - 1)
+    try:
+        model = AlternatingLeastSquares(
+            factors=_FACTORS,
+            iterations=15,
+            regularization=0.01,
+            use_gpu=False,
+            calculate_training_loss=False,
+        )
+        # implicit >= 0.7 fit() expects user x items matrix
+        model.fit(csr_item_user.T.tocsr(), show_progress=False)
+    except Exception as train_exc:
+        logger.error("[train_als_model_task] ALS training failed: %s", train_exc)
+        raise self.retry(exc=train_exc)
+
+    # ── Step 4: Serialise and write to Redis ──────────────────────────────────
+    payload = {
+        "user_factors": np.array(model.user_factors, dtype=np.float32),
+        "item_factors": np.array(model.item_factors, dtype=np.float32),
+        "user2idx":     user2idx,
+        "item2idx":     item2idx,
+        "trained_at":   datetime.now(timezone.utc).isoformat(),
+        "n_users":      n_users,
+        "n_items":      n_items,
+        "factors":      _FACTORS,
+    }
+    rc.setex(_ALS_REDIS_KEY, _ALS_TTL, pickle.dumps(payload, protocol=5))
+
+    elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+    result  = {
+        "status":   "ok",
+        "n_users":  n_users,
+        "n_items":  n_items,
+        "factors":  _FACTORS,
+        "elapsed_s": round(elapsed, 2),
+        "redis_key": _ALS_REDIS_KEY,
+        "redis_ttl": _ALS_TTL,
+    }
+    logger.info("[train_als_model_task] DONE: %s", json.dumps(result))
     return result
 
 
